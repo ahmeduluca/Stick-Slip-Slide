@@ -1,0 +1,42 @@
+{
+  "folders": [
+    {
+      "path": "C:\\Users\\auluca\\WorkSpace\\Stick-Slip-Slide"
+    }
+  ],
+  "settings": {},
+  "launch": {
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "OSM: batch (script picks folder)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "C:\\Users\\auluca\\WorkSpace\\Stick-Slip-Slide\\OSM-data_analysis.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--pattern", "*.CSV",
+        "--tip_radius_um", "5",
+        "--live_plots",
+        "--plot_every", "400",
+        "--summary_plots",
+        "--origin_csv",
+        "--summary_template",
+        "--k_sup_x", "245.0",
+        "--k_frame_z", "450000.0",
+        "--k_frame_x", "200000.0",
+        "--smooth_n", "301",
+        "--allow_no_cal",
+        "--k_touch_min", "500.0",
+        "--dynF2_active_delta", "0.002",
+        "--dynF2_nearzero_delta", "0.0005",
+        "--trans_frac_up", "0.1",
+        "--trans_frac_down", "0.15",
+        "--sliding_lateral_stiffness_thresh", "500.0",
+        "--resticking_lateral_stiffness_thresh", "1000.0",
+      ]
+    }
+  ]
+  }
+}

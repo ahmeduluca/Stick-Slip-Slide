@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+#Julia
+*.jl
+
+# Virtual environments
+.venv/
+venv/
+
+# Data & results (critical)
+results/
+*.CSV
+*.csv
+*.xlsx
+
+# OS / Editor
+.DS_Store
+.vscode/settings.json
+
+# Figures
+*.png
+*.pdf
