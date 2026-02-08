@@ -1,1 +1,48 @@
 Automated data analysis pipeline for oscillatory shearing experiments designed for the investigation of static friction, mindlin contacts and pre-sliding distance of microscale contacts.
+
+# Stick-Slip-Slide
+
+Automated data analysis pipeline for oscillatory shearing experiments (2D indenter / nanoindentation + lateral actuation) targeting:
+- pre-sliding (Mindlin partial slip) behavior
+- stick–slip / transition to gross sliding
+- friction scaling (shear strength vs pressure/area/contact radius)
+- adhesion + roughness corrections and pull-off diagnostics (for Hertzian contacts)
+
+> This repository is part of Ahmed Uluca’s PhD work in Physics.  
+> Status: research code (actively evolving).
+
+---
+
+## What’s in this repo
+
+### Main scripts
+- **`OSM-data_analysis.py`**  
+  Primary analysis pipeline for oscillatory shearing datasets: parses experiments, extracts cycles, fits/derives contact mechanics quantities, and writes summary outputs + figures.
+
+- **`NMDtoCSV.py`**  
+  Converter utility (e.g., vendor/export format → CSV suitable for the pipeline).
+
+- **`roughness_adhesion_pack.py`**  
+  Shared models/utilities for adhesion and roughness-aware contact calculations.
+
+- **Schematic / figure helpers**
+  - `Schematic-friction_scaling_laws.py`
+  - SVG schematics in the repo root (`Fig1_two_scalings_tau.svg`, etc.)
+
+### Output folders (generated)
+- **`out_pulloff/`**  
+  Pull-off / adhesion-related analysis outputs.
+- **`roughness_pack_out/`**  
+  Roughness/adhesion pack outputs (derived quantities, plots, intermediate artifacts).
+
+---
+
+## Quick start
+
+### 1) Create an environment
+Recommended (conda):
+```bash
+conda create -n sss python=3.11 -y
+conda activate sss
+pip install -r requirements.txt
+
