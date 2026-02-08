@@ -1428,9 +1428,6 @@ def fit_flat_end_stiffness(
         "notes": "Fit S(P)=S0 + C*P^(1/3) on positive-load/stiffness window.",
     }
 
-
-import numpy as np
-
 def build_Aref_samples(
     *,
     area_mode_used: str,
@@ -2622,7 +2619,7 @@ def find_calibration_slices_pre_touch(
 
     return cal_lat, cal_vert
 
-def manual_pick_shear_window(t: np.ndarray, P_contact_N: np.ndarray, F2_rms: np.ndarray, initial=[int, int]) -> Tuple[int, int]:
+def manual_pick_shear_window(t: np.ndarray, P_contact_N: np.ndarray, F2_rms: np.ndarray, initial: Optional[List[int]] = None) -> Tuple[int, int]:
     picks = pick_indices_from_plot(
         t,
         series=[("P_contact (N)", P_contact_N), ("Dyn Force 2 RMS", F2_rms)],
@@ -2855,7 +2852,7 @@ def pick_indices_from_plot(
     if n_clicks == 2 and predefined_picks is not None and len(predefined_picks) == 2:
         draw_span(ax, t[predefined_picks[0]], t[predefined_picks[1] ])
 
-    picks: List[int] = predefined_picks
+    picks: List[int] = list(predefined_picks) if predefined_picks is not None else []
     vlines = []
 
     msg = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top")
@@ -3156,7 +3153,11 @@ def detect_stick_slide_transitions(
     # ---- decide thresholds: user-provided takes priority if finite ----
     # stick->slide threshold (must be BELOW stuck)
     Sx_slide = float(sliding_lateral_stiffness_thresh)
-    slide_source = "none"
+    if not (np.isfinite(Sx_slide) and (Sx_slide < Sx_stuck)):
+        Sx_slide = float(frac_up) * Sx_stuck
+        slide_source = "frac"
+    else:
+        slide_source = "user"
 
     # ---- stick->slide: first crossing below Sx_slide on ramp-up ----
     i_ss_rel = None
@@ -3197,6 +3198,7 @@ def detect_stick_slide_transitions(
     
     if i_rs_rel is None:
         Sx_re = float(frac_low) * Sx_stuck
+        went_low = False
         # fallback: fraction of Sx_stuck
         for j, val in enumerate(Sx_rd_s):
             if not np.isfinite(val):
@@ -3667,7 +3669,7 @@ def plot_check_friction_and_transitions(
 
     axlfd1 = axlfd.twinx()
     axlfd1.plot(Dtt * 1e9, Ent * 6.242e12, label=r"Energy Loss", color="orange")
-    axlfd1.set_ylabel("Energy Loss per cycle (meV)")
+    axlfd1.set_ylabel("Energy Loss per cycle (MeV)")
 
 
     picks=[]
@@ -5123,6 +5125,7 @@ def analyze_one_file(fp: Path, cfg: Config, live_plots: bool, outdir: Optional[P
 
 
     # ---- Decide on reference area model (after Hertz diagnostic)
+    area_mode_selected = getattr(cfg, "area_mode", "nominal")  # default from cfg; can be overridden by gate if live_plots
     if live_plots: # and getattr(cfg, "area_pick_enable", False):
     # default comes from cfg.area_mode
         figs.append(plot_flat_end_fit(P_contact_N[load_sl], Sz_arr[load_sl], flat_fit, E_star_Pa=E_star))

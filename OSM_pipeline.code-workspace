@@ -1,51 +1,25 @@
 {
-  "folders": [
-    {
-      "path": "."
-    }
-  ],
-  "settings": {},
-  "launch": {
   "version": "0.2.0",
+  "folders":
+        {
+            "path": "."
+        },
+  "settings": {
+    "python.defaultInterpreterPath": "C:\\Users\\auluca\\Documents\\Workspace\\Stick-Slip-Slide\\.venv\\Scripts\\python.exe"
+  },
   "configurations": [
     {
-      "name": "OSM: batch (script picks folder)",
+      "name": "SSS: batch (YAML config)",
       "type": "debugpy",
       "request": "launch",
-      "program":"C:\\Users\\auluca\\Documents\\WorkSpace\\Stick-Slip-Slide\\OSM-data_analysis.py",
+      "module": "stick_slip_slide.cli",
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": [
-        "--pattern", "*.CSV",
-        "--tip_radius_um", "5.0",
-        "--live_plots",
-        "--plot_every", "1",
-        "--summary_plots",
-        "--origin_csv",
-        "--summary_template",
-        "--k_sup_x", "245.0",
-        "--k_frame_z", "450000.0",
-        "--k_frame_x", "200000.0",
-        "--smooth_n", "101",
-        "--allow_no_cal",
-        "--k_touch_min", "500.0",
-        "--dynF2_active_delta", "0.0002",
-        "--dynF2_nearzero_delta", "0.00005",
-        "--trans_frac_up", "0.01",
-        "--trans_frac_down", "0.15",
-        "--sliding_lateral_stiffness_thresh", "500.0",
-        "--resticking_lateral_stiffness_thresh", "5000.0",
-        "--plot_mindlin",
-        "--hertz_plot",
-        "--manual_mode", "on_fail",
-        "--manual_cycle_mode", "on_fail",
-        "--plot_cycles",
-        "--expected_cycles", "1",
-        "--normal_load_rate_th", "0.005", 
-        "--normal_load_sustain_duration", "0.5",
-        "--normal_load_filter_win", "101",
+        "--config",
+        "configs/osm_batch_debug.yaml"
       ]
     }
   ]
-  }
 }
+

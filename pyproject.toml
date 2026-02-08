@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stick-slip-slide"
+version = "0.1.0"
+description = "Automated analysis of oscillatory stick-slip and sliding experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+authors = [
+  {name = "Ahmed Uluca"}
+]
+
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "matplotlib",
+  "tqdm",
+  "pyyaml"
+]
+
+[project.urls]
+Repository = "https://github.com/ahmeduluca/Stick-Slip-Slide"
+
+# This creates a terminal command: `sss`
+[project.scripts]
+sss = "stick_slip_slide.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

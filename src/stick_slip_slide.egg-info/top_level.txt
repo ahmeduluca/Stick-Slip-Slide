@@ -1,0 +1,6 @@
+check_pipeline
+stick_slip_slide
+test_circular
+test_debug
+test_fitting
+test_isolation

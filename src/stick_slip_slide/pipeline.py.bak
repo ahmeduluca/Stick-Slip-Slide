@@ -1,0 +1,17 @@
+# src/stick_slip_slide/pipeline.py
+from pathlib import Path
+from .io import load_experiment
+
+
+def analyze_batch(cfg: dict):
+    input_dir = Path(cfg["paths"]["input_dir"])
+    output_dir = Path(cfg["paths"]["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for path in input_dir.glob(cfg["paths"]["glob"]):
+        analyze_one_experiment(path, cfg)
+
+def analyze_one_experiment(path, cfg):
+    data = load_experiment(path, cfg)
+    # call cycles → models → fitting → reporting → plotting
+    return
