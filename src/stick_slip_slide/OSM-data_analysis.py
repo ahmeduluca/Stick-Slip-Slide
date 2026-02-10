@@ -555,7 +555,7 @@ def _c_from_tabor(mu: float) -> float:
       JKR: c=1.5
     This is for Fadh = c*pi*R*w_eff (pull-off coefficient).
     For 'transition' we use it as a constant offset model.
-    """
+    """ 
     if not np.isfinite(mu):
         return 0.0
     # smooth monotone map mu: 0.1 -> ~2, 5 -> ~1.5

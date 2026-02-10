@@ -75,11 +75,11 @@ def make_folder_summary_plots(
         ax = fig.add_subplot(111)
         for cyc in range(1, max_cycle_to_plot + 1):
             g = df[df["cycle"] == cyc]
-            g = g[np.isfinite(g["mu_ss"]) & np.isfinite(g["file_x"])]
+            g = g[np.isfinite(g["mu_ss"]) & np.isfinite(g["load_max_mN"])]
             if len(g) < min_points_per_cycle:
                 continue
-            ax.plot(g["file_x"].to_numpy(), g["mu_ss"].to_numpy(), marker="o", linestyle="None", label=f"C{cyc:02d}")
-        ax.set_xlabel("Experiment index (file order)")
+            ax.plot(g["load_max_mN"].to_numpy(), g["mu_ss"].to_numpy(), marker="o", linestyle="None", label=f"C{cyc:02d}")
+        ax.set_xlabel("Load (mN)")
         ax.set_ylabel("μ at stick→slide (mu_ss)")
         ax.set_title("Friction coefficient at stick→slide across experiments (by cycle)")
         ax.legend(loc="best", fontsize=8)
@@ -390,13 +390,11 @@ def plot_mindlin_fit(
     plt.plot(Q * 1e3, K, marker="o", linestyle="", label=label)
 
     # highlight fit range used in summarize_cycle
-    if Q.size > 0:
-        Qmax = float(np.max(Q))
-        lo = cfg.mindlin_min_frac_of_maxF * Qmax
-        hi = cfg.mindlin_max_frac_of_maxF * Qmax
-        in_fit = (Q >= lo) & (Q <= hi)
-        if np.any(in_fit):
-            plt.plot(Q[in_fit] * 1e3, K[in_fit], marker="o", linestyle="", label="Fit subset")
+    if dir:
+        mm = mind.get("mindlin_region", slice(None))
+    else:
+        mm = mind.get("mindlin_rd_region", slice(None))
+    plt.plot(Q[mm] * 1e3, K[mm], marker="o", linestyle="", label="Fit subset")
 
     if int(mind.get("ok", 0)) == 1:
         a = float(mind["a"])
@@ -425,14 +423,20 @@ def plot_hertz_diagnostic(h_m, P_N, fit: dict,
 
     E_star = fit.get("E_star_Pa", np.nan)
     R_eff = fit.get("R_eff_m", np.nan)
-    C = fit.get("C", np.nan)
-
+    F_adh = fit.get("Fadh_N", np.nan)*1e3
+    adhesion_model = fit.get("used_model", "hertz")
+    C = np.sqrt(R_eff) * (4.0/3.0) * E_star if np.isfinite(E_star) and np.isfinite(R_eff) else np.nan
+    
     figures=[]
     # 1) P vs h^(3/2) with fit
     figures.append(plt.figure(figsize=(9, 6)))
     plt.clf()
     x = np.power(np.maximum(0.0, h_m), 1.5)
-    plt.plot(x[mask], P_N[mask]*1e3, "o", label="used (mN)")
+    plt.plot(
+        x[mask],
+        P_N[mask] * 1e3,
+        "o",
+        label=f"Adhesive pull = {F_adh:.2f} mN\n({adhesion_model})" if np.isfinite(F_adh) else "Data")
     if np.isfinite(C):
         xx = np.linspace(safe_nanmin(x[mask]), safe_nanmax(x[mask]), 300)
         yy = C * xx
@@ -485,7 +489,7 @@ def plot_touch_with_pick(df: pd.DataFrame, cfg: Config, touch_i: int, title: str
         plt.axvline(t[touch_i], linestyle="--", linewidth=2, label=f"touch @ {touch_i}")
     plt.xlabel("Time (s)")
     plt.ylabel("Dyn. Stiffness (native)")
-    plt.title(title or "Touch detection (A=accept, R=repick, S=skip)")
+    plt.title(title or "Touch detection (A=accept, R=repick, P=pass)")
     plt.legend(loc="best")
     plt.tight_layout()
 
@@ -506,7 +510,7 @@ def plot_shear_window_with_pick(t: np.ndarray, P_contact_N: np.ndarray, F2_rms: 
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, loc="best")
-    plt.title(title or "Shear window (A=accept, R=repick, S=skip)")
+    plt.title(title or "Shear window (A=accept, R=repick, P=pass)")
     plt.tight_layout()
 
 def set_plot_defaults():

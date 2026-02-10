@@ -3,12 +3,66 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from .config import Config
-from .math_utils import robust_median, _num
+from .math_utils import (robust_median, _num, keep_longest_contiguous)
 from .signal_processing import window_idx_fw
 from .cycle_types import CycleBounds
 from .mechanics import (normal_pressure_Pa, shear_stress_Pa, estimate_lockin_lag_force_sigma,
                           sigma_shear_strength, area_pi_h_R)
 from .fitting import mindlin_fit
+
+# ============================================================
+# Physics–statistics utilities (small, explicit, reusable)
+# ============================================================
+
+def _clean_pos(x) -> np.ndarray:
+    """Keep only finite, strictly-positive values."""
+    x = np.asarray(x, float)
+    return x[np.isfinite(x) & (x > 0)]
+
+def _gauss_positive(rng: np.random.Generator, mu: float, sig: float, n: int, *, floor: float = 1e-30) -> np.ndarray:
+    """
+    Draw Gaussian samples and clamp to a small positive floor.
+
+    Physics/statistics:
+    - Used for "nominal" area uncertainty where A_ref is treated as approximately normal.
+    - Clamping avoids nonphysical negative areas and prevents blow-ups in p=P/A.
+    """
+    mu = float(mu)
+    sig = float(sig)
+    n = int(n)
+
+    if not (np.isfinite(mu) and mu > 0 and np.isfinite(sig) and sig > 0):
+        return np.full(n, mu, dtype=float)
+
+    x = rng.normal(mu, sig, size=n)
+    return np.maximum(x, float(floor))
+
+
+def _clamp_area(A_m2: np.ndarray, amin: float = 1e-30) -> np.ndarray:
+    """
+    Numerical safety: ensure area stays positive to avoid P/A blow-ups.
+    """
+    return np.maximum(np.asarray(A_m2, float), float(amin))
+
+def _summ_median(d: dict | None) -> float:
+    """
+    Extract a representative scalar from a bootstrap summary dict.
+    We use 'median' (robust) rather than mean when distributions are skewed.
+    """
+    if not isinstance(d, dict):
+        return np.nan
+    try:
+        return float(d.get("median", np.nan))
+    except Exception:
+        return np.nan
+
+def _robust_center(x) -> float:
+    """
+    Robust center of a sample (median). Used only for fallbacks when
+    full sampling isn't possible (e.g., too few bootstrap samples).
+    """
+    xs = _clean_pos(x)
+    return float(np.median(xs)) if xs.size else np.nan
 
 def _csv_escape(x) -> str:
     s = "" if x is None else str(x)
@@ -366,8 +420,6 @@ def summarize_cycle(
     t = _num(df, cfg.time_col)
 
     hold = slice(b.i_hold0, b.i_hold1 + 1)  ##hold slice
-    ru = slice(b.i_start, b.i_peak + 1) ##ramp-up slice
-    rd = slice(b.i_hold1 + 1, b.i_end + 1) ##ramp-down slice
     between = window_idx_fw(t, b.i_end, cfg.post_window_s) ##post shear window must be set prior.
 
     P_contact_N = df["P_contact_N"].to_numpy()
@@ -486,35 +538,78 @@ def summarize_cycle(
         s_tau_rs = sigma_shear_strength(Ft_rs_N, A_rs, sigma_Ft_rs, sA_rs) / 1e6  # -> MPa
     else:
         s_tau_rs = np.nan
-    # Mindlin fit on ramp-up: K(Q)
-    Q = Ft[ru]
-    K = Sx[ru]
-    m = np.isfinite(Q) & np.isfinite(K) & (Q > 0) & (K > 0)
-    Q = Q[m]; K = K[m]
-    if Q.size >= cfg.mindlin_min_points:
-        Qmax = float(np.max(Q))
-        lo = cfg.mindlin_min_frac_of_maxF * Qmax
-        hi = cfg.mindlin_max_frac_of_maxF * Qmax
-        mm = (Q >= lo) & (Q <= hi)
-        Qf, Kf = Q[mm], K[mm]
-        mind = mindlin_fit(Qf, Kf) if Qf.size >= cfg.mindlin_min_points else {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(Qf.size), "ok": 0}
+    
+    # Mindlin fit windows
+    if i_ss is not None: # and i_ss > b.i_peak:
+        ru = slice(b.i_start, i_ss + 1) ##ramp-up slice
     else:
-        mind = {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(Q.size), "ok": 0}
-    ## Mindlin fit on ramp-down:
-    Q = Ft[rd]
-    K = Sx[rd]
-    m = np.isfinite(Q) & np.isfinite(K) & (Q > 0) & (K > 0)
-    Q = Q[m]; K = K[m]
-    if Q.size >= cfg.mindlin_min_points:
-        Qmax = float(np.max(Q))
-        lo = cfg.mindlin_min_frac_of_maxF * Qmax
-        hi = cfg.mindlin_max_frac_of_maxF * Qmax
-        mm = (Q >= lo) & (Q <= hi)
-        Qf, Kf = Q[mm], K[mm]
-        mind_rd = mindlin_fit(Qf, Kf) if Qf.size >= cfg.mindlin_min_points else {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(Qf.size), "ok": 0}
+        ru = slice(b.i_start, b.i_peak + 1) ##ramp-up slice (if no clear peak, just use picked srick to slide point as end of ramp-up)
+    
+    if i_rs is not None: # and i_rs < b.i_hold1:
+        rd = slice(i_rs + 1, b.i_end + 1) ##ramp-down slice
     else:
-        mind_rd = {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(Q.size), "ok": 0}
+        rd = slice(b.i_hold1 + 1, b.i_end + 1) ##ramp-down slice just use picked re-stick point as start of ramp-down
+    
+    idx0 = np.arange(ru.start, ru.stop)   # global indices for ru
+    idx1 = np.arange(rd.start, rd.stop)   # global indices for rd
 
+    # ---------------- Ramp-up ----------------
+    Q0 = Ft[idx0]
+    K0 = Sx[idx0]
+    m0 = np.isfinite(Q0) & np.isfinite(K0) & (Q0 > 0) & (K0 > 0)
+
+    sel_slice = None
+    if np.sum(m0) >= cfg.mindlin_min_points:
+        Q1 = Q0[m0]
+        K1 = K0[m0]
+        idx0_valid = idx0[m0]             # <- mapping compressed -> global
+
+        Qmax = float(np.max(Q1))
+        lo = cfg.mindlin_min_frac_of_maxF * Qmax
+        hi = cfg.mindlin_max_frac_of_maxF * Qmax
+
+        mm1 = (Q1 >= lo) & (Q1 <= hi)
+        mm1 = keep_longest_contiguous(mm1, min_len=cfg.mindlin_min_points)
+
+        sel = np.where(mm1)[0]
+        if sel.size:
+            sel_slice = slice(int(idx0_valid[sel[0]]), int(idx0_valid[sel[-1]]) + 1)
+
+        Qf, Kf = Q1[mm1], K1[mm1]
+        mind = mindlin_fit(Qf, Kf) if Qf.size >= cfg.mindlin_min_points else {
+            "a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(Qf.size), "ok": 0
+        }
+    else:
+        mind = {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(np.sum(m0)), "ok": 0}
+
+    # ---------------- Ramp-down ----------------
+    Q0 = Ft[idx1]
+    K0 = Sx[idx1]
+    m0 = np.isfinite(Q0) & np.isfinite(K0) & (Q0 > 0) & (K0 > 0)
+
+    sel_slice_rd = None
+    if np.sum(m0) >= cfg.mindlin_min_points:
+        Q1 = Q0[m0]
+        K1 = K0[m0]
+        idx1_valid = idx1[m0]             # <- mapping compressed -> global
+
+        Qmax = float(np.max(Q1))
+        lo = cfg.mindlin_min_frac_of_maxF * Qmax
+        hi = cfg.mindlin_max_frac_of_maxF * Qmax
+
+        mm1 = (Q1 >= lo) & (Q1 <= hi)
+        mm1 = keep_longest_contiguous(mm1, min_len=cfg.mindlin_min_points)
+
+        sel = np.where(mm1)[0]
+        if sel.size:
+            sel_slice_rd = slice(int(idx1_valid[sel[0]]), int(idx1_valid[sel[-1]]) + 1)
+
+        Qf, Kf = Q1[mm1], K1[mm1]
+        mind_rd = mindlin_fit(Qf, Kf) if Qf.size >= cfg.mindlin_min_points else {
+            "a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(Qf.size), "ok": 0
+        }
+    else:
+        mind_rd = {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(np.sum(m0)), "ok": 0}
     return {
         "cycle": b.cycle,
         "t_start_s": float(t[b.i_start]),
@@ -571,12 +666,14 @@ def summarize_cycle(
         "mindlin_rmse": float(mind.get("rmse", np.nan)),
         "mindlin_n": int(mind.get("n", 0)),
         "mindlin_ok": int(mind.get("ok", 0)),
+        "mindlin_region": sel_slice,
         ## mindlin ramp-down
         "mindlin_a_rd_N_per_m": float(mind_rd.get("a", np.nan)),
         "mindlin_t_rd_N": float(mind_rd.get("t", np.nan)),
         "mindlin_rmse_rd": float(mind_rd.get("rmse", np.nan)),
         "mindlin_n_rd": int(mind_rd.get("n", 0)),
         "mindlin_ok_rd": int(mind_rd.get("ok", 0)),
+        "mindlin_rd_region": sel_slice_rd,
     }
 
 def build_Aref_samples(
@@ -588,85 +685,190 @@ def build_Aref_samples(
     E_star_Pa: float,
     cfg,
     hertz: dict | None,
+    boot_hertz: dict | None,
     boot_flat: dict | None,
     sigma_A_ref: float | None,
     n_fallback: int = 2000,
     seed: int = 0,
-) -> np.ndarray:
+):
     """
-    Return samples of A_ref for uncertainty propagation.
+    Return (A_ref_samples [m^2], diag dict).
 
-    - nominal: Gaussian on A_ref using analytic sigma_A_ref (from sigma_h and sigma_R).
-    - fit_hertz: sample R_eff from Hertz bootstrap CI/std, propagate A ~ pi*h*R for small indentation
-               (Hertzian area_pi_h_R does this properly already).
-    - flat_end: sample directly from flat bootstrap samples of a_flat_m (preferred),
-                or from R_eff_m samples if you want “Hertz-equivalent” path.
+    -------------------------
+    Physics–statistics intent
+    -------------------------
+    We want uncertainty on reference contact area A_ref because many reported quantities
+    are nonlinear in area (pressure p = P/A, shear strength tau = F/A, etc.). Monte Carlo
+    propagation is robust to skew and heavy tails, and it naturally handles nonlinear maps.
 
-    Important: We treat h_ref and P_ref as fixed scalars here.
-               You can extend later to sample h_ref too (but keep it stable first).
+    Areas used in this project:
+    ---------------------------
+    (1) fit_hertz:
+        Use Hertz(+adhesion) effective radius:
+            A = area_pi_h_R(h_ref, R_eff)
+        Uncertainty is primarily in R_eff (and possibly coupled adhesion quantities).
+
+    (2) flat_end:
+        Use additive "flat + Hertz" area model:
+            A = pi*a_flat^2 + area_pi_h_R(h_ref, R_eff)
+        where a_flat captures baseline/flat-punch-like stiffness leakage and R_eff captures
+        the Hertz-like scaling part. Both are extracted from the SAME flat_end fit, so their
+        uncertainties can be correlated.
+
+    Correlation-aware sampling:
+    ---------------------------
+    If two parameters come from the same bootstrap draw, sampling them independently can
+    create unphysical combinations and distort uncertainty (often inflating tails). We:
+      - compute corrcoef from paired bootstrap samples;
+      - preserve pairing if |rho| >= rho_thr; else independent is OK.
+
+    rho_thr defaults to cfg.ref_unc_rho_thr if present, else 0.3.
     """
     rng = np.random.default_rng(int(seed))
-
     mode = (area_mode_used or "").lower()
+    n = int(n_fallback)
 
-    # helper: safe nominal Gaussian
-    def _gauss_positive(mu, sig, n):
-        if not (np.isfinite(mu) and mu > 0 and np.isfinite(sig) and sig > 0):
-            return np.full(int(n), float(mu))
-        x = rng.normal(float(mu), float(sig), size=int(n))
-        # clamp to small positive to avoid division blowups
-        return np.maximum(x, 1e-30)
+    rho_thr = float(getattr(cfg, "ref_unc_rho_thr", 0.3))
 
-    # --- nominal path ---
+    diag: dict = {
+        "area_mode_used": str(area_mode_used),
+        "path": None,
+        "n_samples": int(n),
+        "seed": int(seed),
+        "rho_thr": float(rho_thr),
+    }
+
+    def _resample(x: np.ndarray, n_: int) -> np.ndarray:
+        return rng.choice(x, size=int(n_), replace=True)
+
+    # -----------------------
+    # nominal path (instrument/geometry uncertainty already collapsed into sigma_A_ref)
+    # -----------------------
     if mode.startswith("nominal"):
+        diag["path"] = "nominal"
         if sigma_A_ref is None:
-            return np.full(int(n_fallback), float(A_ref))
-        return _gauss_positive(A_ref, sigma_A_ref, n_fallback)
+            diag["fallback_used"] = "A_ref_scalar"
+            return np.full(n, float(A_ref)), diag
+        return _gauss_positive(float(A_ref), float(sigma_A_ref), n), diag
 
-    # --- Hertz-fit path ---
+    # -----------------------
+    # fit_hertz path
+    # -----------------------
     if mode == "fit_hertz":
-        # Prefer bootstrap CI/std if present in `hertz`
+        diag["path"] = "fit_hertz"
+
+        # ---- use bootstrap if present ----
+        if boot_hertz and int(boot_hertz.get("ok", 0)) == 1:
+            s = boot_hertz.get("samples", {}) or {}
+            R = _clean_pos(s.get("R_eff_m", None))
+            diag["boot_hertz_n_boot_ok"] = int(boot_hertz.get("n_boot_ok", R.size))
+            diag["boot_hertz_R_n"] = int(R.size)
+
+            # checkpoint: adhesion model stability under resampling
+            if "adhesion_model_used_mode" in boot_hertz:
+                diag["adhesion_model_used_mode"] = boot_hertz.get("adhesion_model_used_mode")
+            if "adhesion_model_used_frac" in boot_hertz:
+                diag["adhesion_model_used_frac"] = float(boot_hertz.get("adhesion_model_used_frac"))
+
+            # optional correlation checkpoints if extra fields are present
+            # (These don't change A unless you later propagate those too, but they're valuable diagnostics.)
+            for k in ("w_eff_J_per_m2", "Fadh_N", "z0_m"):
+                if k in s:
+                    x = np.asarray(s[k], float)
+                    m = np.isfinite(x) & np.isfinite(s.get("R_eff_m", np.nan))
+                    # recompute with aligned, positive R only
+                    Rraw = np.asarray(s.get("R_eff_m", np.nan), float)
+                    mm = m & np.isfinite(Rraw) & (Rraw > 0)
+                    xx = x[mm]
+                    RR = Rraw[mm]
+                    if xx.size > 10:
+                        rho = float(np.corrcoef(RR, xx)[0, 1])
+                        diag[f"hertz_corr_R_{k}"] = float(rho) if np.isfinite(rho) else np.nan
+
+            if R.size > 10:
+                R_pick = _resample(R, n)
+                A = area_pi_h_R(np.full(n, float(h_ref)), R_pick)
+                return _clamp_area(A), diag
+
+        # ---- fallback: deterministic from main fit dict ----
         Rm = float(hertz.get("R_eff_m", np.nan)) if hertz else np.nan
-        Rstd = float(hertz.get("R_eff_std_m", np.nan)) if hertz else np.nan
+        diag["hertz_R_eff_m"] = float(Rm) if np.isfinite(Rm) else np.nan
+        if np.isfinite(Rm) and Rm > 0:
+            A = area_pi_h_R(np.full(n, float(h_ref)), np.full(n, Rm))
+            diag["fallback_used"] = "hertz_main_fit_R_only"
+            return _clamp_area(A), diag
 
-        if not (np.isfinite(Rm) and Rm > 0):
-            return np.full(int(n_fallback), float(A_ref))
+        diag["fallback_used"] = "A_ref_scalar"
+        return np.full(n, float(A_ref)), diag
 
-        # sample radius; if no std, keep deterministic
-        if np.isfinite(Rstd) and Rstd > 0:
-            R_s = rng.normal(Rm, Rstd, size=int(n_fallback))
-            R_s = np.maximum(R_s, 1e-12)
-        else:
-            R_s = np.full(int(n_fallback), Rm)
-
-        # area from geometric model
-        # A = area_pi_h_R(h_ref, R)
-        # but vectorize:
-        return area_pi_h_R(np.full_like(R_s, float(h_ref)), R_s)
-
-    # --- flat-end path ---
+    # -----------------------
+    # flat_end path
+    # -----------------------
     if mode == "flat_end":
-        if boot_flat and int(boot_flat.get("ok", 0)) == 1:
-            samples = boot_flat.get("samples", {})
-            a_s = samples.get("a_flat_m", None)
-            if a_s is not None and np.asarray(a_s).size > 10:
-                a_s = np.asarray(a_s, float)
-                a_s = a_s[np.isfinite(a_s) & (a_s > 0)]
-                if a_s.size > 10:
-                    # resample to n_fallback size
-                    pick = rng.choice(a_s, size=int(n_fallback), replace=True)
-                    return np.pi * pick * pick
+        diag["path"] = "flat_end"
 
-            # fallback: sample R_eff_m if present and propagate via nominal h_ref geometry
-            R_s = samples.get("R_eff_m", None)
-            if R_s is not None and np.asarray(R_s).size > 10:
-                R_s = np.asarray(R_s, float)
-                R_s = R_s[np.isfinite(R_s) & (R_s > 0)]
-                if R_s.size > 10:
-                    pick = rng.choice(R_s, size=int(n_fallback), replace=True)
-                    return area_pi_h_R(np.full_like(pick, float(h_ref)), pick)
+        if not (boot_flat and int(boot_flat.get("ok", 0)) == 1):
+            diag["fallback_used"] = "A_ref_scalar"
+            return np.full(n, float(A_ref)), diag
 
-        return np.full(int(n_fallback), float(A_ref))
+        s = boot_flat.get("samples", {}) or {}
 
+        # Paired arrays from same bootstrap draw (important!)
+        a_raw = np.asarray(s.get("a_flat_m", []), float)
+        R_raw = np.asarray(s.get("R_eff_m", []), float)
+
+        m = np.isfinite(a_raw) & (a_raw > 0) & np.isfinite(R_raw) & (R_raw > 0)
+        a = a_raw[m]
+        R = R_raw[m]
+        diag["flat_pair_n"] = int(a.size)
+
+        if a.size > 10 and R.size > 10:
+            rho = float(np.corrcoef(a, R)[0, 1]) if a.size >= 2 else 0.0
+            if not np.isfinite(rho):
+                rho = 0.0
+            diag["flat_corr_a_R"] = float(rho)
+
+            use_pairing = (abs(rho) >= rho_thr)
+            diag["flat_use_pairing"] = bool(use_pairing)
+
+            if use_pairing:
+                j = rng.integers(0, a.size, size=n)
+                a_pick = a[j]
+                R_pick = R[j]
+            else:
+                a_pick = _resample(a, n)
+                R_pick = _resample(R, n)
+
+            A_flat = np.pi * a_pick * a_pick
+            A_hz = area_pi_h_R(np.full(n, float(h_ref)), R_pick)
+            return _clamp_area(A_flat + A_hz), diag
+
+        # fallback: deterministic medians (robust) for missing/short bootstrap samples
+        a0 = _summ_median(boot_flat.get("a_flat_m", None))
+        if not (np.isfinite(a0) and a0 > 0):
+            a0 = _robust_center(s.get("a_flat_m", None))
+
+        R0 = _summ_median(boot_flat.get("R_eff_m", None))
+        if not (np.isfinite(R0) and R0 > 0):
+            R0 = _robust_center(s.get("R_eff_m", None))
+
+        diag["flat_corr_a_R"] = np.nan
+        diag["flat_use_pairing"] = False
+        diag["fallback_used"] = "flat_medians"
+        diag["flat_a0_m"] = float(a0) if np.isfinite(a0) else np.nan
+        diag["flat_R0_m"] = float(R0) if np.isfinite(R0) else np.nan
+
+        if (np.isfinite(a0) and a0 > 0) and (np.isfinite(R0) and R0 > 0):
+            A_flat = np.full(n, np.pi * float(a0) * float(a0))
+            A_hz = area_pi_h_R(np.full(n, float(h_ref)), np.full(n, float(R0)))
+            return _clamp_area(A_flat + A_hz), diag
+
+        diag["fallback_used"] = "A_ref_scalar"
+        return np.full(n, float(A_ref)), diag
+
+    # -----------------------
     # unknown mode -> deterministic
-    return np.full(int(n_fallback), float(A_ref))
+    # -----------------------
+    diag["path"] = "unknown_mode"
+    diag["fallback_used"] = "A_ref_scalar"
+    return np.full(n, float(A_ref)), diag

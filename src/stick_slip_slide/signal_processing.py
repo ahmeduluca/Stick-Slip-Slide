@@ -53,6 +53,7 @@ def detect_cycles(
 ) -> List[CycleBounds]:
     t = _num(df, cfg.time_col)
     a = np.nan_to_num(_num(df, cfg.F2_rms_col), nan=0.0)
+    cycles: List[CycleBounds] = []
 
     n = len(a)
     if n < 10:
@@ -69,10 +70,10 @@ def detect_cycles(
     hold_min_pts = max(3, int(cfg.min_hold_s / max(dt, 1e-12)))
 
     # Smooth envelope for amplitude
-    a_s = rolling_median(a, cfg.smooth_n)
+    a_s = a #rolling_median(a, cfg.smooth_n)
 
     # Extra smoothing for derivative stability
-    a_sd = rolling_median(a, cfg.dfdt_smooth_n)
+    a_sd = a_s #rolling_median(a, cfg.dfdt_smooth_n)
     da = np.gradient(a_sd, t)
 
     # zero out outside shear window
@@ -91,7 +92,7 @@ def detect_cycles(
     # Derivative thresholds
     scale = float(safe_nanmax(np.abs(da[start_i:end_i + 1])))
     if not np.isfinite(scale) or scale <= 0:
-        raise RuntimeError("Cycle detection: derivative scale is zero; check signal/window.")
+        return cycles #raise RuntimeError("Cycle detection: derivative scale is zero; check signal/window.")
 
     dthr = cfg.dfdt_thr_frac * scale
     dhold = cfg.dfdt_hold_frac * dthr
@@ -101,13 +102,13 @@ def detect_cycles(
     hold_like = np.abs(da) <= dhold
 
     up_regs = [(s, e) for (s, e) in contiguous_regions(ramp_up) if (e - s + 1) >= ramp_min_pts]
-    if not up_regs:
-        raise RuntimeError("No ramp-up regions found; tune dfdt_thr_frac/min_ramp_s.")
 
-    cycles: List[CycleBounds] = []
     cursor = start_i
     cyc = 0
 
+    if not up_regs:
+         return cycles  # No ramp-up regions found; return empty list
+    
     for (us, ue) in up_regs:
         if us < cursor:
             continue
@@ -168,9 +169,6 @@ def detect_cycles(
         cyc += 1
         cycles.append(CycleBounds(cyc, i_start, i_peak, i_hold0, i_hold1, i_end))
         cursor = i_end + 1
-
-    if not cycles:
-        raise RuntimeError("No cycles accepted after derivative-based filtering.")
 
     return cycles
 
@@ -413,7 +411,7 @@ def want_manual(cfg: Config, mode: str, failed: bool) -> bool:
 def approve_or_repick_gate(figures, fig_title: str = "") -> str:
     """
     Returns: "accept" | "repick_touch" | "repick_window" | "repick_cycles"
-    Raises on skip/abort.
+    Raises on pass/abort.
     """
     decision = {"val": None}
 
@@ -427,8 +425,8 @@ def approve_or_repick_gate(figures, fig_title: str = "") -> str:
             decision["val"] = "repick_window"
         elif k == "c":
             decision["val"] = "repick_cycles"
-        elif k == "s":
-            decision["val"] = "skip"
+        elif k == "p":
+            decision["val"] = "pass"
         elif k == "escape":
             decision["val"] = "abort"
 
@@ -447,8 +445,8 @@ def approve_or_repick_gate(figures, fig_title: str = "") -> str:
         return "accept"
     if decision["val"] in {"repick_touch","repick_window","repick_cycles"}:
         return decision["val"]
-    if decision["val"] == "skip":
-        raise RuntimeError("User skipped file.")
+    if decision["val"] == "pass":
+        raise RuntimeError("User passed file.")
     raise RuntimeError("User aborted.")
 # ============================================================
 # ============================================================
@@ -523,6 +521,7 @@ def find_shear_window_from_normal_load_v2(
     w = max(11, int(smooth_n))
     P_sm = pd.Series(P_contact_N).rolling(w, center=True, min_periods=1).median().to_numpy()
     dPdt = np.gradient(P_sm, t)
+    dPdt = pd.Series(dPdt).rolling(w, center=True, min_periods=1).median().to_numpy()
 
     start = max(0, int(touch_i))
     if start >= n - 2:

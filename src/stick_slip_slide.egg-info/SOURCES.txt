@@ -36,4 +36,3 @@ src/stick_slip_slide/models/friction_scaling.py
 src/stick_slip_slide/models/mindlin.py
 src/stick_slip_slide/models/roughness.py
 src/stick_slip_slide/models/roughness_adhesion_pack.py
-src/stick_slip_slide/plotting/__init__.py

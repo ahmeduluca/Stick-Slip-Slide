@@ -97,7 +97,7 @@ def differentiate_wrt_t(t, y):
     return dy
 
 def mindlin_model(Q: np.ndarray, a: float, t: float) -> np.ndarray:
-    return a * np.power(np.maximum(1e-30, 1.0 - (Q / t)), 1.0 / 3.0)
+    return a * np.cbrt(np.maximum(1e-30, 1.0 - (Q / t)))
 
 def area_from_flat_end_fit(
     P_N: np.ndarray,
@@ -131,3 +131,37 @@ def summarize_dist(x: np.ndarray, ci: float = 0.95) -> dict:
         "std": float(np.std(x, ddof=1)) if x.size > 1 else 0.0,
         "ci95": (float(np.quantile(x, lo)), float(np.quantile(x, hi))),
     }
+
+def keep_longest_contiguous(mask: np.ndarray, *, min_len: int) -> np.ndarray:
+    """
+    Given a boolean mask over an array, keep only the longest contiguous True block.
+    Returns a new boolean mask (same shape). If no block >= min_len, returns all-False.
+    """
+    mask = np.asarray(mask, bool)
+    n = mask.size
+    if n == 0:
+        return mask
+
+    # Find starts/ends of True runs
+    d = np.diff(mask.astype(np.int8))
+    starts = np.where(d == 1)[0] + 1
+    ends   = np.where(d == -1)[0] + 1
+
+    if mask[0]:
+        starts = np.r_[0, starts]
+    if mask[-1]:
+        ends = np.r_[ends, n]
+
+    if starts.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+
+    lengths = ends - starts
+    j = int(np.argmax(lengths))
+    if lengths[j] < int(min_len):
+        return np.zeros_like(mask, dtype=bool)
+
+    out = np.zeros_like(mask, dtype=bool)
+    out[starts[j]:ends[j]] = True
+    return out
+
+

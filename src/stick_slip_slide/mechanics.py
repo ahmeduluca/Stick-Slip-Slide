@@ -35,9 +35,18 @@ def vertical_stiffness_frame_corrected(Sz_raw_N_per_m: np.ndarray, k_frame_z: Op
         Sz = 1.0 / np.maximum(1e-30, (1.0 / np.maximum(1e-30, Sz_raw_N_per_m)) - (1.0 / float(k_frame_z)))
     return Sz
 
-def area_pi_h_R(h_m: np.ndarray, R_m: float) -> np.ndarray:
-    h = np.maximum(0.0, h_m)
-    return np.pi * h * float(R_m)
+def area_pi_h_R(h_m: np.ndarray, R_m) -> np.ndarray:
+    """
+    Area proxy A = pi * h * R.
+
+    Backward-compatible:
+      - If R_m is a scalar.
+      - If R_m is an array: vectorized (broadcasts with h_m).
+    """
+    h = np.maximum(0.0, np.asarray(h_m, float))
+    R = np.asarray(R_m, float)  # scalar or array
+    return np.pi * h * R
+
 
 def normal_pressure_Pa(P_N: np.ndarray, A_m2: np.ndarray) -> np.ndarray:
     return P_N / np.maximum(1e-30, A_m2)
@@ -250,7 +259,6 @@ def hertz_fit_radius(h_m: np.ndarray, P_N: np.ndarray, E_star_Pa: float, hardnes
     ok = 1 if (np.isfinite(R_eff) and R_eff > 0 and np.isfinite(C)) else 0
     return {"ok": ok, "E_star_Pa": float(E_star_Pa), "C": float(C), "R_eff_m": float(R_eff), "rmse_N": float(rmse), "n_used": int(np.where(m_fit)[0].size), "mask_used": m_fit}
 
-
 def hertz_apparent_radius_R_of_h(h_m: np.ndarray, P_N: np.ndarray, E_star_Pa: float) -> np.ndarray:
     """Pointwise apparent radius from rearranged Hertz: R = [ (3P)/(4E* h^(3/2)) ]^2"""
     h = np.asarray(h_m, float)
@@ -261,7 +269,6 @@ def hertz_apparent_radius_R_of_h(h_m: np.ndarray, P_N: np.ndarray, E_star_Pa: fl
     R[~np.isfinite(R)] = np.nan
     return R
 
-
 def a_from_stiffness_Sneddon(Sz_N_per_m: np.ndarray, E_star_Pa: float) -> np.ndarray:
     Sz = np.asarray(Sz_N_per_m, float)
     a = np.full_like(Sz, np.nan, dtype=float)
@@ -270,7 +277,6 @@ def a_from_stiffness_Sneddon(Sz_N_per_m: np.ndarray, E_star_Pa: float) -> np.nda
         a[m] = Sz[m] / (2.0 * E_star_Pa)
     return a
 
-
 def a_from_depth_sphere(h_m: np.ndarray, R_m: float) -> np.ndarray:
     h = np.asarray(h_m, float)
     a = np.full_like(h, np.nan, dtype=float)
@@ -278,7 +284,6 @@ def a_from_depth_sphere(h_m: np.ndarray, R_m: float) -> np.ndarray:
         m = np.isfinite(h) & (h > 0)
         a[m] = np.sqrt(R_m * h[m])
     return a
-
 
 def w_eff_from_roughness(w_J_per_m2: float, sigma_rms_m: float | None, model: str = "none", delta0_m: float = 0.3e-9) -> float:
     w = float(w_J_per_m2)
@@ -293,7 +298,6 @@ def w_eff_from_roughness(w_J_per_m2: float, sigma_rms_m: float | None, model: st
         return w * float(np.exp(- (sig / delta0_m) ** 2))
     return w
 
-
 def _hertz_load_from_h(h_m: np.ndarray, R_m: float, E_star_Pa: float) -> np.ndarray:
     h = np.asarray(h_m, float)
     out = np.full_like(h, np.nan, dtype=float)
@@ -301,7 +305,6 @@ def _hertz_load_from_h(h_m: np.ndarray, R_m: float, E_star_Pa: float) -> np.ndar
     if np.any(m):
         out[m] = (4.0/3.0) * E_star_Pa * np.sqrt(R_m) * (h[m] ** 1.5)
     return out
-
 
 def _c_from_tabor(mu: float) -> float:
     if not np.isfinite(mu):
@@ -312,12 +315,10 @@ def _c_from_tabor(mu: float) -> float:
     t = float(np.clip(t, 0.0, 1.0))
     return float(2.0 - 0.5*t)
 
-
 def _tabor_mu(R_m: float, w_eff: float, E_star_Pa: float, z0_m: float) -> float:
     if not (np.isfinite(R_m) and R_m > 0 and np.isfinite(w_eff) and w_eff >= 0 and np.isfinite(E_star_Pa) and E_star_Pa > 0 and np.isfinite(z0_m) and z0_m > 0):
         return np.nan
     return float(((R_m * (w_eff**2)) / ((E_star_Pa**2) * (z0_m**3))) ** (1.0/3.0))
-
 
 def _jkr_P_from_a(a_m: np.ndarray, R_m: float, E_star_Pa: float, w_J_per_m2: float) -> np.ndarray:
     a = np.asarray(a_m, dtype=float)
@@ -326,14 +327,12 @@ def _jkr_P_from_a(a_m: np.ndarray, R_m: float, E_star_Pa: float, w_J_per_m2: flo
     term_adh = np.sqrt(np.maximum(0.0, 8.0*np.pi*w*E*(a**3)))
     return term_el - term_adh
 
-
 def _jkr_h_from_a(a_m: np.ndarray, R_m: float, E_star_Pa: float, w_J_per_m2: float) -> np.ndarray:
     a = np.asarray(a_m, dtype=float)
     R = float(R_m); E = float(E_star_Pa); w = float(w_J_per_m2)
     term_geom = (a**2)/R
     term_adh = np.sqrt(np.maximum(0.0, (8.0*np.pi*w*a)/(3.0*E)))
     return term_geom - term_adh
-
 
 def _jkr_P_from_h(h_m: np.ndarray, R_m: float, E_star_Pa: float, w_J_per_m2: float, n_bisect: int = 60) -> np.ndarray:
     h = np.asarray(h_m, dtype=float)
@@ -370,7 +369,6 @@ def _jkr_P_from_h(h_m: np.ndarray, R_m: float, E_star_Pa: float, w_J_per_m2: flo
         out[i] = _jkr_P_from_a(np.array([a_sol]), R, E, w)[0]
     return out
 
-
 def _auto_model_from_mu(mu: float, mu_dmt: float = 0.1, mu_jkr: float = 5.0) -> str:
     if not np.isfinite(mu):
         return "hertz"
@@ -380,18 +378,15 @@ def _auto_model_from_mu(mu: float, mu_dmt: float = 0.1, mu_jkr: float = 5.0) -> 
         return "jkr"
     return "transition"
 
-
 def a_from_Sz(Sz_N_per_m, E_star_Pa):
     Sz = np.asarray(Sz_N_per_m, float)
     if not (np.isfinite(E_star_Pa) and E_star_Pa > 0):
         return np.full_like(Sz, np.nan)
     return Sz / (2.0 * E_star_Pa)
 
-
 def A_from_a(a_m):
     a = np.asarray(a_m, float)
     return np.pi * a*a
-
 
 def estimate_R_from_a_and_h(a_m, h_m, *, min_h=1e-9):
     a = np.asarray(a_m, float); h = np.asarray(h_m, float)
@@ -401,7 +396,6 @@ def estimate_R_from_a_and_h(a_m, h_m, *, min_h=1e-9):
     R = (a[m]**2) / h[m]
     return float(np.nanmedian(R))
 
-
 def estimate_R_from_a_and_P(a_m, P_N, E_star_Pa, *, min_P=1e-6):
     a = np.asarray(a_m, float); P = np.asarray(P_N, float)
     m = np.isfinite(a) & np.isfinite(P) & (a > 0) & (P > min_P)
@@ -409,7 +403,6 @@ def estimate_R_from_a_and_P(a_m, P_N, E_star_Pa, *, min_P=1e-6):
         return np.nan
     R = ((4.0/3.0) * E_star_Pa * (a[m]**3)) / P[m]
     return float(np.nanmedian(R))
-
 
 # Public aliases expected by other modules (non-underscored names)
 hertz_load_from_h = _hertz_load_from_h

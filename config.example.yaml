@@ -4,26 +4,29 @@ core:
   k_frame_x: 200000.0
   pattern: "*.csv"
   outdir: "results"
+  k_sup_x_fallback: 450.0 # N/m
+  b_sup_x_fallback: 0.0 # N s/m
+  allow_no_cal: True
 
 touch:
   k_touch_min: 500.0
   k_touch_min_duration_s: 0.1
   loading_rate_threshold: 0.001
   normal_load_sustain: 0.5
-  normal_load_smooth: 201
+  normal_load_smooth: 301
 
 cycles:
-  smooth_n: 501
-  dynF2_baseline_q: 0.05
-  dynF2_active_delta: 0.03
-  dynF2_nearzero_delta: 0.01
+  smooth_n: 101
+  dynF2_baseline_q: 0.01
+  dynF2_active_delta: 0.01
+  dynF2_nearzero_delta: 0.005
   hold_top_frac: 0.98
   hold_min_s: 0.2
   min_cycle_points: 200
-  dfdt_smooth_n: 301
-  dfdt_thr_frac: 0.001
+  dfdt_smooth_n: 101
+  dfdt_thr_frac: 0.0001
   dfdt_hold_frac: 0.9
-  min_ramp_s: 2.0
+  min_ramp_s: 10.0
   min_hold_s: 0.5
   expected_cycles: 3
 

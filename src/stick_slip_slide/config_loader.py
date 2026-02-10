@@ -67,7 +67,16 @@ def load_config_yaml(path: str | Path) -> Config:
         updates["pattern"] = core["pattern"]
     if "batch" in core:
         updates["batch"] = core["batch"]
+    if "outdir" in core:
+        updates["outdir"] = core["outdir"]
 
+    if "k_sup_x" in core:
+        updates["k_sup_x"] = float(core["k_sup_x"])
+    if "b_sup_x" in core:
+        updates["b_sup_x"] = float(core["b_sup_x"])
+    if "allow_no_cal" in core:
+        updates["allow_no_cal"] = bool(core["allow_no_cal"])
+        
     # touch
     if "k_touch_min" in touch:
         updates["k_touch_min"] = float(touch["k_touch_min"])

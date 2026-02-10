@@ -40,65 +40,108 @@ except Exception:
 def mindlin_fit(Q: np.ndarray, K: np.ndarray, *, min_points: int = 10) -> Dict[str, float]:
     """
     Fit Mindlin-like stiffness decay:
-        K(Q) = a * (1 - Q/t)^(1/3)
+        K(Q) = a * (1 - Q/t)^(1/3), with a>0 and t>max(Q).
     Returns dict(a,t,rmse,n,ok,scipy_fit).
     """
     Q = np.asarray(Q, float)
     K = np.asarray(K, float)
-    m = np.isfinite(Q) & np.isfinite(K) & (Q > 0) & (K > 0)
+
+    # Allow Q==0; require positive stiffness
+    m = np.isfinite(Q) & np.isfinite(K) & (Q >= 0) & (K > 0)
     Q = Q[m]; K = K[m]
 
-    if Q.size < int(min_points):
-        return {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(Q.size), "ok": 0, "scipy_fit": int(SCIPY_OK)}
+    n = int(Q.size)
+    if n < int(min_points):
+        return {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": n, "ok": 0, "scipy_fit": int(SCIPY_OK)}
+
+    # Sort by Q (stabilizes quantiles + any future weighting)
+    srt = np.argsort(Q)
+    Q = Q[srt]
+    K = K[srt]
 
     Qmax = float(np.max(Q))
-    # initial guesses
-    q20 = float(np.quantile(Q, 0.2)) if Q.size >= 5 else float(np.min(Q))
-    a0 = float(np.nanmedian(K[Q <= q20])) if np.any(Q <= q20) else float(np.nanmedian(K))
-    t0 = 1.2 * Qmax
+    # more robust "effective max"
+    Qhi = float(np.quantile(Q, 0.95)) if n >= 20 else Qmax
 
+    # initial guesses
+    q20 = float(np.quantile(Q, 0.2)) if n >= 5 else float(np.min(Q))
+    a0 = float(np.nanmedian(K[Q <= q20])) if np.any(Q <= q20) else float(np.nanmedian(K))
+    if not np.isfinite(a0) or a0 <= 0:
+        a0 = float(np.nanmax(K))  # fallback
+    t0 = 1.2 * max(Qhi, 1e-18)
+
+    # --- SciPy branch ---
     if SCIPY_OK:
         try:
+            from scipy.optimize import curve_fit
+
             # bounds: a positive, t must exceed Qmax
+            a_ub = max(1e-9, 10.0 * float(np.nanmax(K)))  # safer than tying to a0
+            t_lb = 1.001 * Qmax
+            t_ub = 100.0 * max(Qmax, 1e-18)
+
             popt, _ = curve_fit(
                 mindlin_model, Q, K,
-                p0=[a0, t0],
-                bounds=([1e-12, 1.001 * Qmax], [max(1e-9, 100.0 * a0), 100.0 * max(Qmax, 1e-12)]),
+                p0=[a0, max(t0, t_lb)],
+                bounds=([1e-12, t_lb], [a_ub, t_ub]),
                 maxfev=20000,
             )
             a_hat, t_hat = float(popt[0]), float(popt[1])
+
+            # Guard domain (just in case)
+            if not (np.isfinite(a_hat) and np.isfinite(t_hat) and a_hat > 0 and t_hat > Qmax):
+                raise ValueError("bad_fit")
+
             Khat = mindlin_model(Q, a_hat, t_hat)
             rmse = float(np.sqrt(np.mean((K - Khat) ** 2)))
-            return {"a": a_hat, "t": t_hat, "rmse": rmse, "n": int(Q.size), "ok": 1, "scipy_fit": 1}
+            return {"a": a_hat, "t": t_hat, "rmse": rmse, "n": n, "ok": 1, "scipy_fit": 1}
         except Exception:
             pass
 
-    # fallback grid if SciPy missing or failed
-    t_grid = np.linspace(1.01 * Qmax, 3.0 * Qmax, 200)
+    # --- Pure-numpy fallback: grid over t + closed-form a for each t (CORRECT) ---
+    # Use a wider, more informative grid. Log-spacing tends to work better.
+    t_min = 1.01 * Qmax
+    t_max = 100.0 * max(Qmax, 1e-18)
+
+    if t_min >= t_max:
+        # degenerate, but keep safe
+        return {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": n, "ok": 0, "scipy_fit": 0}
+
+    t_grid = np.geomspace(t_min, t_max, 300)
+
+    y = K**3  # linear in a^3
     best_rmse = np.inf
     best_a = np.nan
     best_t = np.nan
 
-    # linearize: K^3 = a^3 (1 - Q/t) => 1/K^3 ~ (1/a^3) * 1/(1 - Q/t)
-    invK3 = 1.0 / np.maximum(1e-30, K**3)
+    eps = 1e-30
     for t in t_grid:
-        x = np.maximum(1e-30, (1.0 - Q / t))  # avoid negative near singularity
+        # enforce domain safely
+        if not (t > Qmax):
+            continue
+        x = 1.0 - Q / t
+        x = np.maximum(eps, x)
+
+        # Solve y ≈ b*x (through origin), b = a^3
         denom = float(np.dot(x, x))
-        if denom <= 0:
+        if denom <= eps:
             continue
-        c = float(np.dot(x, invK3) / denom)  # c ~ 1/a^3
-        if not (np.isfinite(c) and c > 0):
+        b = float(np.dot(x, y) / denom)
+        if not (np.isfinite(b) and b > 0):
             continue
-        a = float((1.0 / c) ** (1.0 / 3.0))
-        Khat = mindlin_model(Q, a, t)
+
+        a = float(b ** (1.0 / 3.0))
+
+        Khat = mindlin_model(Q, a, float(t))
         rmse = float(np.sqrt(np.mean((K - Khat) ** 2)))
+
         if rmse < best_rmse:
             best_rmse = rmse
             best_a = a
             best_t = float(t)
 
-    ok = int(np.isfinite(best_a) and np.isfinite(best_t))
-    return {"a": best_a, "t": best_t, "rmse": best_rmse, "n": int(Q.size), "ok": ok, "scipy_fit": 0}
+    ok = int(np.isfinite(best_a) and np.isfinite(best_t) and best_a > 0 and best_t > Qmax)
+    return {"a": best_a, "t": best_t, "rmse": float(best_rmse), "n": n, "ok": ok, "scipy_fit": 0}
 
 # ---------------------------------------------------------------------
 # 2) Support spring fit (pre-touch)
@@ -226,7 +269,6 @@ def hertz_fit_radius_adhesion(
     stiff_wt: float = 0.0,
 ) -> dict:
     """
-    See your current docstring — logic preserved, but:
       - depends only on mechanics public kernels
       - returns mask_used (useful for diagnostics + bootstrap)
     """
@@ -550,21 +592,106 @@ def fit_flat_end_stiffness(
     X = np.column_stack([np.ones_like(x), x])
 
     # Weighted least squares solver
-    def _wls(beta_w: np.ndarray):
-        W = beta_w[:, None]  # (n,1)
-        XtWX = X.T @ (W * X)
-        XtWy = X.T @ (beta_w * y)
-        beta = np.linalg.solve(XtWX, XtWy)
+    def _wls_nonneg(beta_w: np.ndarray):
+        """
+        Pure-NumPy weighted least squares with nonnegativity constraints:
+            beta = [S0, C] with S0 >= 0, C >= 0
+        Minimizes: sum_i w_i * (y_i - (S0 + C*x_i))^2
+
+        Drop-in replacement for _wls(): returns (beta, yhat, resid, XtWX)
+
+        Safety tweaks:
+        - Handles all-zero weights
+        - Treats ill-conditioned XtWX as singular (cond > 1e12)
+        - Uses tiny eps thresholds to avoid 0-division
+        """
+        w = np.asarray(beta_w, float)
+        w = np.maximum(w, 0.0)
+
+        # If all weights are zero, avoid crashes
+        if not np.any(w > 0):
+            beta = np.array([np.nan, np.nan], float)
+            yhat = X @ beta
+            resid = y - yhat
+            XtWX = np.full((2, 2), np.nan, float)
+            return beta, yhat, resid, XtWX
+
+        # Precompute normal-equation pieces
+        Wcol = w[:, None]
+        XtWX = X.T @ (Wcol * X)          # 2x2
+        XtWy = X.T @ (w * y)             # 2,
+
+        # Helper: weighted SSE
+        def sse(beta):
+            r = y - (X @ beta)
+            return float(np.sum(w * r * r))
+
+        # ---- Candidate 1: unconstrained WLS ----
+        beta_uc = None
+        try:
+            # treat very ill-conditioned as singular
+            if not np.all(np.isfinite(XtWX)) or np.linalg.cond(XtWX) > 1e12:
+                raise np.linalg.LinAlgError("ill_conditioned")
+            beta_uc = np.linalg.solve(XtWX, XtWy)
+        except np.linalg.LinAlgError:
+            beta_uc = None
+
+        # If feasible, it's optimal (convex QP)
+        if beta_uc is not None and np.all(np.isfinite(beta_uc)):
+            if beta_uc[0] >= 0.0 and beta_uc[1] >= 0.0:
+                beta = beta_uc
+                yhat = X @ beta
+                resid = y - yhat
+                return beta, yhat, resid, XtWX
+
+        candidates = []
+
+        # ---- Candidate 2: boundary S0 = 0, fit C >= 0 ----
+        # minimize sum w*(y - C*x)^2 => C = (x^T W y)/(x^T W x)
+        x = X[:, 1]
+        denom = float(np.sum(w * x * x))
+        if denom > 1e-30:
+            C_hat = float(np.sum(w * x * y) / denom)
+        else:
+            C_hat = 0.0
+        C_hat = max(0.0, C_hat)
+        candidates.append(np.array([0.0, C_hat], float))
+
+        # ---- Candidate 3: boundary C = 0, fit S0 >= 0 ----
+        # minimize sum w*(y - S0)^2 => S0 = weighted mean
+        wsum = float(np.sum(w))
+        if wsum > 1e-30:
+            S0_hat = float(np.sum(w * y) / wsum)
+        else:
+            S0_hat = 0.0
+        S0_hat = max(0.0, S0_hat)
+        candidates.append(np.array([S0_hat, 0.0], float))
+
+        # ---- Candidate 4: corner (0,0) ----
+        candidates.append(np.array([0.0, 0.0], float))
+
+        # Pick best feasible candidate by weighted SSE
+        best_beta = None
+        best_val = np.inf
+        for b in candidates:
+            if np.all(np.isfinite(b)) and (b[0] >= 0.0) and (b[1] >= 0.0):
+                val = sse(b)
+                if val < best_val:
+                    best_val = val
+                    best_beta = b
+
+        beta = best_beta if best_beta is not None else np.array([np.nan, np.nan], float)
         yhat = X @ beta
         resid = y - yhat
         return beta, yhat, resid, XtWX
+
 
     # ---- Robust loop (Huber + optional sigma-clip) ----
     w = np.ones_like(y)
     beta = None
     XtWX = None
     for _ in range(int(max(1, n_iter if robust else 1))):
-        beta, yhat, resid, XtWX = _wls(w)
+        beta, yhat, resid, XtWX = _wls_nonneg(w)
 
         if not robust:
             break
@@ -853,59 +980,45 @@ def bootstrap_hertz_radius_uncertainty(
     keep_frac: float = 1.0,
     min_success: int = 30,
     block_size: int | None = 10,
+    # ---- new: collect more coupled outputs for correlation-aware propagation ----
+    collect_fields: tuple[str, ...] = ("w_eff_J_per_m2", "Fadh_N", "z0_m"),
 ) -> dict:
     """
-    Bootstrap uncertainty for fitted Hertz/adhesion effective radius R_eff_m.
+    Bootstrap uncertainty for fitted Hertz/adhesion parameters.
 
-    Why bootstrap here?
-    -------------------
-    The fitted radius R is extracted from a *subset* of a load–indentation curve. Noise,
-    drift, and (often) correlation between neighboring samples make analytic covariance
-    unreliable. Bootstrap gives a practical uncertainty estimate for R that can be propagated
-    into area/pressure/shear strength.
+    Physics:
+    --------
+    The Hertz(+adhesion) fitter extracts an effective tip radius R_eff (and, depending
+    on model, adhesion-related quantities like w_eff, Fadh, z0). These parameters are
+    *coupled*: noisy data and model tradeoffs can produce correlated variations across
+    bootstrap resamples.
 
-    Resampling strategy
-    -------------------
-    - If data are sequential (common in loading sweeps), neighboring points are
-      correlated. Using IID resampling can underestimate uncertainty.
-    - A block bootstrap resamples contiguous blocks of length `block_size` (5–15 typical)
-      to preserve local correlation structure.
+    Statistics:
+    -----------
+    - We use (block) bootstrap resampling to respect correlation in sequential sweeps.
+    - We store *paired* samples: each bootstrap draw yields one tuple of parameters.
+      This enables correct uncertainty propagation into nonlinear derived quantities
+      and enables correlation diagnostics.
 
-    Parameters
-    ----------
-    h_m, P_N:
-        Indentation (>=0) and load arrays, same length.
-    Sz_meas_N_per_m:
-        Optional measured normal stiffness aligned with h,P. If provided and
-        `fit_fn` supports it (as in the updated hertz_fit_radius_adhesion), it is passed
-        through to keep the bootstrap consistent with the fit.
-    fit_fn:
-        Typically hertz_fit_radius_adhesion.
-    fit_kwargs:
-        kwargs for fit_fn. Extra kwargs are *silently dropped* if fit_fn doesn't accept them.
-    keep_frac:
-        Fraction of the available points used per bootstrap draw (m out of n). Use <1 to
-        reduce influence of tails/outliers and plasticity onset points.
-    block_size:
-        If None or <=1: IID bootstrap. Else: block bootstrap with blocks of this length.
-
-    Returns
-    -------
-    dict with:
-      ok, reason, n_used, n_boot_ok,
+    Returns dict:
+    -------------
+      ok, reason, n_used, n_boot_ok, keep_frac, block_size,
       R_eff_std_m, R_eff_ci95_lo_m, R_eff_ci95_hi_m,
-      samples_R_eff_m (raw samples for propagation),
-      adhesion_model_used_mode / frac (if model varies under auto)
+      samples: {
+         "R_eff_m": array([...]),
+         <optional fields in collect_fields> : array([...])  # aligned with R_eff draws
+         "adhesion_model_used": array([...]) (dtype=str)
+      },
+      plus: adhesion_model_used_mode / frac if available.
     """
     fit_kwargs = dict(fit_kwargs or {})
 
-    # ---- Filter kwargs to fit_fn signature to avoid any "unexpected kwarg" errors ----
+    # ---- Filter kwargs to fit_fn signature to avoid "unexpected kwarg" errors ----
     try:
         sig = inspect.signature(fit_fn)
         accepted = set(sig.parameters.keys())
         fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in accepted}
     except Exception:
-        # If inspection fails, we proceed without filtering; fit errors are caught per draw.
         pass
 
     # ---- sanitize & align arrays ----
@@ -920,7 +1033,6 @@ def bootstrap_hertz_radius_uncertainty(
     if Sz_meas_N_per_m is not None:
         Sz = np.asarray(Sz_meas_N_per_m, float)
         if Sz.shape != h.shape:
-            # keep it simple: if misaligned, ignore Sz in bootstrap
             Sz = None
 
     m = np.isfinite(h) & np.isfinite(P) & (h >= 0)
@@ -939,31 +1051,31 @@ def bootstrap_hertz_radius_uncertainty(
 
     # sample size per draw
     msize = int(max(min_points, round(float(keep_frac) * n)))
-    msize = min(msize, n)  # never exceed available points
+    msize = min(msize, n)
 
     rng = np.random.default_rng(seed)
 
-    # ---- block bootstrap sampler ----
+    # ---- block bootstrap sampler (indices into the filtered arrays) ----
     def _draw_indices() -> np.ndarray:
         if (block_size is None) or (int(block_size) <= 1):
-            # IID resampling with replacement
             return rng.integers(0, n, size=msize)
 
         B = int(max(1, block_size))
         nblocks = int(np.ceil(msize / B))
-        # starting indices for blocks
         starts = rng.integers(0, max(1, n - B + 1), size=nblocks)
         idx = np.concatenate([np.arange(s, s + B) for s in starts])
         return idx[:msize]
 
-    # ---- call fit consistently with the adhesion fitter ----
     def _call_fit(hb: np.ndarray, Pb: np.ndarray, Szb: np.ndarray | None):
         if Szb is not None:
             return fit_fn(hb, Pb, *fit_args, Sz_meas_N_per_m=Szb, **fit_kwargs)
         return fit_fn(hb, Pb, *fit_args, **fit_kwargs)
 
+    # ---- collect paired samples ----
     R_list: list[float] = []
     model_used: list[str] = []
+
+    extra_lists: dict[str, list[float]] = {k: [] for k in collect_fields}
 
     for _ in range(int(max(10, n_boot))):
         idx = _draw_indices()
@@ -986,20 +1098,26 @@ def bootstrap_hertz_radius_uncertainty(
         R_list.append(float(Rb))
         model_used.append(str(res.get("adhesion_model_used", res.get("adhesion_model", ""))))
 
+        # collect requested coupled fields (store NaN if missing so lengths stay aligned)
+        for k in collect_fields:
+            vb = res.get(k, np.nan)
+            extra_lists[k].append(float(vb) if np.isfinite(vb) else np.nan)
+
     R = np.asarray(R_list, float)
-    if R.size < int(min_success):
+    n_ok = int(R.size)
+    if n_ok < int(min_success):
         return {"ok": 0, "reason": "too_few_successful_bootstraps",
-                "n_used": n, "n_boot_ok": int(R.size),
+                "n_used": n, "n_boot_ok": n_ok,
                 "R_eff_std_m": np.nan, "R_eff_ci95_lo_m": np.nan, "R_eff_ci95_hi_m": np.nan}
 
-    # Standard bootstrap summaries (distribution may be skewed; CI from percentiles is robust)
     R_std = float(np.std(R, ddof=1)) if R.size >= 2 else np.nan
     lo, hi = np.percentile(R, [2.5, 97.5])
 
     out = {
         "ok": 1, "reason": "",
         "n_used": n,
-        "n_boot_ok": int(R.size),
+        "n_boot_ok": n_ok,
+        "n_boot": int(n_boot),
         "keep_frac": float(keep_frac),
         "block_size": (int(block_size) if (block_size is not None) else None),
 
@@ -1007,8 +1125,12 @@ def bootstrap_hertz_radius_uncertainty(
         "R_eff_ci95_lo_m": float(lo),
         "R_eff_ci95_hi_m": float(hi),
 
-        # raw samples for propagation (area/pressure/shear)
-        "samples_R_eff_m": R,
+        # Paired raw samples for propagation
+        "samples": {
+            "R_eff_m": R,
+            "adhesion_model_used": np.asarray(model_used, dtype=str),
+            **{k: np.asarray(v, float) for k, v in extra_lists.items()},
+        }
     }
 
     # If auto model switches across resamples, report most frequent
@@ -1019,6 +1141,7 @@ def bootstrap_hertz_radius_uncertainty(
         out["adhesion_model_used_frac"] = float(counts[j] / np.sum(counts))
 
     return out
+
 
 
 def filter_kwargs_for_callable(fn, kwargs: dict) -> dict:

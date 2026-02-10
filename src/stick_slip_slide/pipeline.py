@@ -113,7 +113,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
       - manual_pick_touch(df, cfg) -> int
       - manual_pick_shear_window(t, P_contact_N, F2_rms) -> (i0:int, i1:int)
       - manual_pick_cycles(df2, cfg, i0, i1) -> List[CycleBounds]
-      - approve_or_repick_gate(fig_title) -> "accept"|"repick" (raises on skip/abort)
+      - approve_or_repick_gate(fig_title) -> "accept"|"repick" (raises on pass/abort)
       - sanity_plot_window_cycles(...) can accept i0/i1 possibly None; cycles possibly None/[]
       - window_idx_fw(t, center_i, halfwidth_s) exists (forward window around i0)
       - vertical_stiffness_frame_corrected(Sz_arr, cfg.k_frame_z) exists
@@ -225,7 +225,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     if auto_ok and win is not None:
         try:
             cycles = detect_cycles(df2, cfg, start_i=win[0], end_i=win[1])
-            if not cycles:
+            if not cycles or len(cycles) == 0:
                 raise RuntimeError("No cycles detected")
         except Exception as e:
             auto_ok = False
@@ -261,7 +261,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
                     df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N,
                     i0=win[0], i1=win[1], cycles=cycles, cal_sl=cal_sl_lat, title=fp.stem
                 )
-        decision = approve_or_repick_gate(figs, "approve (a)/ repick touch (t) / repick window (w) / repick cycles (c) / skip (s) / abort (esc)")
+        decision = approve_or_repick_gate(figs, "approve (a)/ repick touch (t) / repick window (w) / repick cycles (c) / pass (p) / abort (esc)")
         figs = []
     else:
         decision = "approve"  # no manual mode
@@ -277,17 +277,26 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         # recompute cal dynamics + df2
         df2, cal_sl_lat, cal_sl_vert, k_sup_z_dyn, b_sup_z_dyn, cpl = _compute_df2(df, cfg, markers, scale, touch_i)
         # recompute shear window + cycles
-        i0, i1 = find_shear_window_from_normal_load_v2(t, P_contact_N, touch_i,cfg)
-        win = (int(i0), int(i1))
+        try:
+            i0, i1 = find_shear_window_from_normal_load_v2(t, P_contact_N, touch_i,cfg)
+            win = (int(i0), int(i1))
+        except:
+            i0, i1 = None, None
         i0, i1 = manual_pick_shear_window(t, P_contact_N, F2_rms=df2[cfg.F2_rms_col], initial=[i0,i1])
         win = (int(i0), int(i1))
-        cycles = detect_cycles(df2, cfg, start_i=i0, end_i=i1)  # or manual_pick_cycles too
+        try:
+            cycles = detect_cycles(df2, cfg, start_i=i0, end_i=i1)  # or manual_pick_cycles
+        except Exception as e:
+            cycles = []
         cycles = manual_pick_cycles(df2, cfg, i0, i1, initial=cycles, n_cycles=cfg.expected_cycles)
 
     elif decision == "repick_window":
         i0, i1 = manual_pick_shear_window(t, P_contact_N, F2_rms=df2[cfg.F2_rms_col], initial=[i0,i1])
         win = (int(i0), int(i1))
-        cycles = detect_cycles(df2, cfg, start_i=i0, end_i=i1)  # or manual_pick_cycles too
+        try:
+            cycles = detect_cycles(df2, cfg, start_i=i0, end_i=i1)  # or manual_pick_cycles
+        except Exception as e:
+            cycles = []
         cycles = manual_pick_cycles(df2, cfg, i0, i1, initial=cycles, n_cycles=cfg.expected_cycles)
 
     elif decision == "repick_cycles":
@@ -439,7 +448,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             min_success=int(getattr(cfg, "flat_boot_min_success", 50)),
             block_size=int(getattr(cfg, "flat_boot_block", 10)),
         )
-    boot = {"ok": 0}
+    boot_hertz = {"ok": 0}
     if getattr(cfg, "hertz_enable", False):
         if (touch_i is not None) and (i0 is not None) and (int(i0) > int(touch_i) + 5):
             load_sl = slice(int(touch_i), int(i0) + 1)
@@ -467,7 +476,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             hertz = hertz_fit_radius_adhesion(h_load, P_load, **filter_kwargs_for_callable(hertz_fit_radius_adhesion, hertz_kwargs))
 
             # --- bootstrap fit ---
-            boot = bootstrap_hertz_radius_uncertainty(
+            boot_hertz = bootstrap_hertz_radius_uncertainty(
                 h_load, P_load,
                 fit_fn=hertz_fit_radius_adhesion,
                 fit_kwargs=filter_kwargs_for_callable(hertz_fit_radius_adhesion, hertz_kwargs),
@@ -479,17 +488,6 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
                 min_success=int(getattr(cfg, "hertz_boot_min_success", 30)),
                 block_size=int(getattr(cfg, "hertz_boot_block", 10)),
             )
-
-            # attach bootstrap summaries into hertz dict
-            hertz.update({
-                "R_eff_std_m": boot.get("R_eff_std_m", np.nan),
-                "R_eff_ci95_lo_m": boot.get("R_eff_ci95_lo_m", np.nan),
-                "R_eff_ci95_hi_m": boot.get("R_eff_ci95_hi_m", np.nan),
-                "hertz_boot_ok": int(boot.get("ok", 0)),
-                "hertz_boot_n_ok": int(boot.get("n_boot_ok", 0)),
-                "adhesion_model_used_mode": boot.get("adhesion_model_used_mode", ""),
-                "adhesion_model_used_frac": boot.get("adhesion_model_used_frac", np.nan),
-            })
         else:
             hertz = {"ok": 0, "reason": "loading segment empty/too short"}
 
@@ -498,14 +496,14 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     area_mode_selected = getattr(cfg, "area_mode", "nominal")  # default from cfg; can be overridden by gate if live_plots
     if live_plots: # and getattr(cfg, "area_pick_enable", False):
     # default comes from cfg.area_mode
-        figs.append(plot_flat_end_fit(P_contact_N[load_sl], Sz_arr[load_sl], flat_fit, E_star_Pa=E_star))
+        figs.append(plot_flat_end_fit(P_contact_N[load_sl], Sz_arr[load_sl], flat_fit, E_star_Pa=E_star) if flat_fit.get("ok", 0) else None)
         figs.extend(plot_hertz_diagnostic(
-                    h_load, P_load, hertz,
+                    h_m[load_sl], P_contact_N[load_sl], hertz,
                     title=fp.stem,
                     hardness_Pa=cfg.hardness_Pa,
                     plasticity_p0_frac=cfg.plasticity_p0_frac
-                ))
-        area_mode_selected = choose_area_mode_gate(figures=figs, default_mode=getattr(cfg, "area_mode", "nominal"))
+                ) if hertz.get("ok", 0) else [])
+        area_mode_selected = choose_area_mode_gate(figures=figs, default_mode=getattr(cfg, "area_mode", "nominal")) if figs else area_mode_selected
         # then pass a local cfg-like choice into compute_area_from_choice
         figs = []  # clear figs after decision
     
@@ -557,18 +555,19 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         A_ref_nominal = float(robust_median(A_nominal[ref_i])) if ref_i.size else float(A_nominal[i0])
 
     # sample A_ref in a way that matches the chosen area model
-    A_ref_samples = build_Aref_samples(
+    A_ref_samples, diag = build_Aref_samples(
         area_mode_used=area_mode_used,
         A_ref=float(A_ref),
         h_ref=float(h_ref),
         P_ref=float(P_ref),
         E_star_Pa=float(E_star),
         cfg=cfg,
-        hertz=hertz,
-        boot_flat=boot_flat,
-        sigma_A_ref=sigma_A_ref_nominal,
-        n_fallback=int(getattr(cfg, "ref_unc_n", 2000)),
-        seed=int(getattr(cfg, "ref_unc_seed", 0)),
+        hertz = hertz,
+        boot_hertz = boot_hertz,
+        boot_flat = boot_flat,
+        sigma_A_ref = sigma_A_ref_nominal,
+        n_fallback = int(getattr(cfg, "ref_unc_n", 2000)),
+        seed = int(getattr(cfg, "ref_unc_seed", 0)),
     )
 
     A_stats = summarize_dist(A_ref_samples)
@@ -582,6 +581,9 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
 
     # useful to store for later propagation
     df2["pressure_ref_GPa"] = p_report_GPa
+
+    for k, v in diag.items():
+        df2[f"aref_diag_{k}"] = v
 
     # -----------------------------
     # 9) Per-cycle report
@@ -778,12 +780,45 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     report["w_eff_J_per_m2"] = float(hertz.get("w_eff_J_per_m2", np.nan)) if np.isfinite(hertz.get("w_eff_J_per_m2", np.nan)) else np.nan
     report["tabor_mu"] = float(hertz.get("tabor_mu", np.nan)) if np.isfinite(hertz.get("tabor_mu", np.nan)) else np.nan
     report["Fadh_N"] = float(hertz.get("Fadh_N", np.nan)) if np.isfinite(hertz.get("Fadh_N", np.nan)) else np.nan
+    # ---- Hertz bootstrap outputs (from bootstrap_hertz_radius_uncertainty)
+    report["hertz_boot_ok"] = int(boot_hertz.get("ok", 0)) if isinstance(boot_hertz, dict) else 0
+    report["hertz_boot_n_ok"] = int(boot_hertz.get("n_boot_ok", 0)) if isinstance(boot_hertz, dict) else 0
+    report["hertz_boot_n_boot"] = int(boot_hertz.get("n_boot", 0)) if isinstance(boot_hertz, dict) else 0
+    report["hertz_boot_keep_frac"] = float(boot_hertz.get("keep_frac", np.nan)) if (isinstance(boot_hertz, dict) and np.isfinite(boot_hertz.get("keep_frac", np.nan))) else np.nan
+    report["hertz_boot_block_size"] = int(boot_hertz.get("block_size", 0)) if isinstance(boot_hertz, dict) and boot_hertz.get("block_size", None) is not None else 0
 
-    report["R_eff_std_um"] = float(hertz.get("R_eff_std_m", np.nan) * 1e6) if np.isfinite(hertz.get("R_eff_std_m", np.nan)) else np.nan
-    report["R_eff_ci95_lo_um"] = float(hertz.get("R_eff_ci95_lo_m", np.nan) * 1e6) if np.isfinite(hertz.get("R_eff_ci95_lo_m", np.nan)) else np.nan
-    report["R_eff_ci95_hi_um"] = float(hertz.get("R_eff_ci95_hi_m", np.nan) * 1e6) if np.isfinite(hertz.get("R_eff_ci95_hi_m", np.nan)) else np.nan
-    report["hertz_boot_ok"] = int(hertz.get("hertz_boot_ok", 0))
-    report["hertz_boot_n_ok"] = int(hertz.get("hertz_boot_n_ok", 0))
+    if isinstance(boot_hertz, dict) and int(boot_hertz.get("ok", 0)) == 1:
+        report["R_eff_std_um"] = float(boot_hertz.get("R_eff_std_m", np.nan) * 1e6) if np.isfinite(boot_hertz.get("R_eff_std_m", np.nan)) else np.nan
+        report["R_eff_ci95_lo_um"] = float(boot_hertz.get("R_eff_ci95_lo_m", np.nan) * 1e6) if np.isfinite(boot_hertz.get("R_eff_ci95_lo_m", np.nan)) else np.nan
+        report["R_eff_ci95_hi_um"] = float(boot_hertz.get("R_eff_ci95_hi_m", np.nan) * 1e6) if np.isfinite(boot_hertz.get("R_eff_ci95_hi_m", np.nan)) else np.nan
+
+        # model-switch checkpoint (very useful)
+        report["adhesion_model_used_mode"] = str(boot_hertz.get("adhesion_model_used_mode", ""))
+        report["adhesion_model_used_frac"] = float(boot_hertz.get("adhesion_model_used_frac", np.nan)) if np.isfinite(boot_hertz.get("adhesion_model_used_frac", np.nan)) else np.nan
+
+        # (optional) how many valid paired samples were actually stored
+        s = boot_hertz.get("samples", {}) or {}
+        report["hertz_boot_samples_n"] = int(np.size(s.get("R_eff_m", [])))
+    else:
+        report["R_eff_std_um"] = np.nan
+        report["R_eff_ci95_lo_um"] = np.nan
+        report["R_eff_ci95_hi_um"] = np.nan
+        report["adhesion_model_used_mode"] = ""
+        report["adhesion_model_used_frac"] = np.nan
+        report["hertz_boot_samples_n"] = 0
+
+    if isinstance(boot_hertz, dict) and int(boot_hertz.get("ok", 0)) == 1:
+        report["R_eff_std_um"] = float(boot_hertz.get("R_eff_std_m", np.nan) * 1e6) if np.isfinite(boot_hertz.get("R_eff_std_m", np.nan)) else np.nan
+        report["R_eff_ci95_lo_um"] = float(boot_hertz.get("R_eff_ci95_lo_m", np.nan) * 1e6) if np.isfinite(boot_hertz.get("R_eff_ci95_lo_m", np.nan)) else np.nan
+        report["R_eff_ci95_hi_um"] = float(boot_hertz.get("R_eff_ci95_hi_m", np.nan) * 1e6) if np.isfinite(boot_hertz.get("R_eff_ci95_hi_m", np.nan)) else np.nan
+    else:
+        report["R_eff_std_um"] = np.nan
+        report["R_eff_ci95_lo_um"] = np.nan
+        report["R_eff_ci95_hi_um"] = np.nan
+    report["hertz_boot_ok"] = int(boot_hertz.get("ok", 0)) if isinstance(boot_hertz, dict) else 0
+    report["hertz_boot_n_ok"] = int(boot_hertz.get("n_boot_ok", 0)) if isinstance(boot_hertz, dict) else 0
+    report["hertz_boot_n_boot"] = int(boot_hertz.get("n_boot", 0)) if isinstance(boot_hertz, dict) else 0
+
 
     # ---- Flat-end fit + bootstrap outputs (fit is optional but useful)
     if isinstance(flat_fit, dict):
@@ -800,26 +835,26 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         report["flat_end_R2"] = np.nan
 
     report["flat_end_boot_ok"] = int(boot_flat.get("ok", 0)) if isinstance(boot_flat, dict) else 0
-    report["flat_end_boot_n_success"] = int(boot_flat.get("n_success", 0)) if isinstance(boot_flat, dict) else 0
+    report["flat_end_boot_n_success"] = int(boot_flat.get("n_boot_ok", 0)) if isinstance(boot_flat, dict) else 0
     report["flat_end_boot_keep_frac"] = float(boot_flat.get("keep_frac", np.nan)) if (isinstance(boot_flat, dict) and np.isfinite(boot_flat.get("keep_frac", np.nan))) else np.nan
     report["flat_end_boot_n_boot"] = int(boot_flat.get("n_boot", 0)) if isinstance(boot_flat, dict) else 0
 
     # CI summaries (only if ok)
     if isinstance(boot_flat, dict) and int(boot_flat.get("ok", 0)) == 1:
-        a_sum = boot_flat.get("a_flat_um", {})
-        R_sum = boot_flat.get("R_eff_um", {})
-        C_sum = boot_flat.get("C", {})
-        S0_sum = boot_flat.get("S0_N_per_m", {})
+        a_sum = boot_flat.get("a_flat_um", {})      # summary dict
+        R_sum = boot_flat.get("R_eff_um", {})       # summary dict
+        C_sum = boot_flat.get("C", {})              # summary dict
+        S0_sum = boot_flat.get("S0_N_per_m", {})    # summary dict
 
         report["flat_end_a_flat_med_um"] = float(a_sum.get("median", np.nan))
         report["flat_end_a_flat_std_um"] = float(a_sum.get("std", np.nan))
-        report["flat_end_a_flat_ci95_lo_um"] = float(a_sum.get("ci95", (np.nan, np.nan))[0])
-        report["flat_end_a_flat_ci95_hi_um"] = float(a_sum.get("ci95", (np.nan, np.nan))[1])
+        report["flat_end_a_flat_ci95_lo_um"] = float(a_sum.get("ci95_lo", np.nan))
+        report["flat_end_a_flat_ci95_hi_um"] = float(a_sum.get("ci95_hi", np.nan))
 
         report["flat_end_R_eff_med_um"] = float(R_sum.get("median", np.nan))
         report["flat_end_R_eff_std_um"] = float(R_sum.get("std", np.nan))
-        report["flat_end_R_eff_ci95_lo_um"] = float(R_sum.get("ci95", (np.nan, np.nan))[0])
-        report["flat_end_R_eff_ci95_hi_um"] = float(R_sum.get("ci95", (np.nan, np.nan))[1])
+        report["flat_end_R_eff_ci95_lo_um"] = float(R_sum.get("ci95_lo", np.nan))
+        report["flat_end_R_eff_ci95_hi_um"] = float(R_sum.get("ci95_hi", np.nan))
 
         report["flat_end_S0_med_N_per_m"] = float(S0_sum.get("median", np.nan))
         report["flat_end_S0_std_N_per_m"] = float(S0_sum.get("std", np.nan))
@@ -838,6 +873,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         report["flat_end_S0_std_N_per_m"] = np.nan
         report["flat_end_C_med"] = np.nan
         report["flat_end_C_std"] = np.nan
+
 
     # ---- Transfer function (actuator MCK) outputs (dict-style)
     report["mass_kg"] = float(actuator_mck_vertical.get("m_eff", np.nan)) if isinstance(actuator_mck_vertical, dict) else np.nan
@@ -1112,7 +1148,7 @@ def analyze_batch(
 
     if summary_plots:
         figs = make_folder_summary_plots(all_cycles_df, outdir)
-        figs = show_and_wait(figures=figs)
+        figs = show_and_wait(fig_title="folder summaries", figures=figs)
 
     return wide_dyn, summaries_df_short
 
