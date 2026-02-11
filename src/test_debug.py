@@ -22,7 +22,7 @@ if '# DEBUG:' not in content:
             insert_line = i
             break
     
-   if insert_line > 0:
+    if insert_line > 0:
         lines.insert(insert_line, '# DEBUG: About to define functions')
         lines.insert(insert_line + 1, 'print("DEBUG: fitting.py reached function definitions", file=__import__("sys").stderr)')
         

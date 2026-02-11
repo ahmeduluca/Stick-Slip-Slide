@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import sys
-import astimport traceback
+import traceback
 
 # Test: manually load the module to see where it errors
 module_code = None

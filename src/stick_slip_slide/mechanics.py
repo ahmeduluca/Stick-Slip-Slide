@@ -118,9 +118,14 @@ def total_sliding_cyc_dist_speed(
     total_time = float(tt[-1] - tt[0])
 
     N = float(freq_Hz * total_time)          # oscillation cycles
-    D = float(4.0 * freq_Hz * np.trapezoid(AA, tt))   # total slide distance over sinusoid
+    version = np.__version__
+    if version < "2.0":
+        D = float(4.0 * freq_Hz * np.trapz(AA, tt))   # total slide distance over sinusoid
+        A_mean_time = float(np.trapz(AA, tt) / total_time)
+    else:
+        D = float(4.0 * freq_Hz * np.trapezoid(AA, tt))   # total slide distance over sinusoid
+        A_mean_time = float(np.trapezoid(AA, tt) / total_time)
     v_max = float(2.0 * np.pi * freq_Hz * max(AA))  # max(|v|) over a sinusoid
-    A_mean_time = float(np.trapezoid(AA, tt) / total_time)
     v_mean = float(4.0 * freq_Hz * A_mean_time) # mean(|v|) over a sinusoid
 
     totals = {

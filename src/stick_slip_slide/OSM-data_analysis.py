@@ -2250,7 +2250,7 @@ class Config:
     F2_rms_col: str = "Dyn. Force 2"
     X2_rms_col: str = "Dyn. Disp. 2"
     PH2_col: str = "Dyn. Phase 2"  # displacement relative to force
-    dyn_f2_freq_Hz: float = 80.0    # lateral dither frequency
+    dyn_f2_freq_Hz: float = 80.0    # lateral CSM frequency
     lockin_slope_hw: float = 0.05  # Hz, half-width for slope calc
 
     # detect shear window parameters

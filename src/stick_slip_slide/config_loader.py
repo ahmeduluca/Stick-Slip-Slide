@@ -8,7 +8,7 @@ import yaml
 import numpy as np
 import argparse
 
-from .config import Config  # wherever your Config dataclass lives
+from .config import Config
 
 
 # ---- unit conversion helpers ----

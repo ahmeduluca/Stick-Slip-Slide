@@ -136,12 +136,17 @@ def make_folder_summary_plots(
     if "A_ratio_to_ref" in df.columns:
         fig = plt.figure()
         ax = fig.add_subplot(111)
-        g = df[np.isfinite(df["A_ratio_to_ref"]) & (df["A_ratio_to_ref"] > 0)]
-        if not g.empty:
-            ax.plot(g["cycle"].to_numpy(), g["A_ratio_to_ref"].to_numpy(), marker="o", linestyle="None")
-        ax.set_xlabel("Cycle number")
-        ax.set_ylabel("A/A0 (junction growth proxy)")
+        for cyc in range(1, max_cycle_to_plot + 1):
+            g = df[df["cycle"] == cyc]
+            try:
+                if not g.empty:
+                    ax.plot(g["mu_ss"].to_numpy(),(g["A_ratio_to_ref"].to_numpy())**2-1, marker="o", linestyle="None", label=f"Cycle #{cyc:02d}")
+            except:
+                continue         
+        ax.set_xlabel("Normalized lateral force squared at transition")
+        ax.set_ylabel("(A/A_0)^2-1 (junction growth proxy)")
         ax.set_title("Junction growth proxy across all experiments")
+        ax.legend()
         ax.grid(True, alpha=0.3)
         figs.append(fig)
         if save_png:

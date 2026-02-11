@@ -19,7 +19,7 @@ def _clean_pos(x) -> np.ndarray:
     x = np.asarray(x, float)
     return x[np.isfinite(x) & (x > 0)]
 
-def _gauss_positive(rng: np.random.Generator, mu: float, sig: float, n: int, *, floor: float = 1e-30) -> np.ndarray:
+def _gauss_positive(rng: np.random.Generator, mu: float, sig: float, n: int = 1, *, floor: float = 1e-30) -> np.ndarray:
     """
     Draw Gaussian samples and clamp to a small positive floor.
 
@@ -328,8 +328,8 @@ def build_wide_summary_dynamic(all_cycles_df: pd.DataFrame, summaries_df: pd.Dat
         "Sz_sliding","A_ratio_to_ref","K_ratio_to_ref",
         "mindlin_a_N_per_m","mindlin_t_N","mindlin_rmse","mindlin_ok",
         "mindlin_a_rd_N_per_m","mindlin_t_rd_N","mindlin_rmse_rd","mindlin_ok_rd",
-        "total_sliding_time_s","total_osc_cycles","total_slide_dist_m",
-        "overall_mean_speed_m_per_s",
+        "total_sliding_time_s", "total_osc_cycles", "total_slide_dist_m", "max_instantaneous_speed_m_per_s",
+        "mean_instantaneous_speed_m_per_s", "overall_mean_speed_m_per_s",
     ] if c in df.columns]
 
 
@@ -749,7 +749,7 @@ def build_Aref_samples(
         if sigma_A_ref is None:
             diag["fallback_used"] = "A_ref_scalar"
             return np.full(n, float(A_ref)), diag
-        return _gauss_positive(float(A_ref), float(sigma_A_ref), n), diag
+        return _gauss_positive(rng, float(A_ref), float(sigma_A_ref), n), diag
 
     # -----------------------
     # fit_hertz path
