@@ -13,7 +13,7 @@ touch:
   k_touch_min_duration_s: 0.1
   loading_rate_threshold: 0.001
   normal_load_sustain: 0.5
-  normal_load_smooth: 301
+  normal_load_smooth: 501
 
 cycles:
   smooth_n: 101
@@ -34,7 +34,7 @@ transition:
   trans_frac_up: 0.1
   trans_frac_down: 0.15
   sliding_lateral_stiffness_thresh: 500.0
-  resticking_lateral_stiffness_thresh: 1000.0
+  resticking_lateral_stiffness_thresh: 600.0
   trans_low_band: [0.05, 0.20]
   trans_smooth_n: 21
 
@@ -42,10 +42,10 @@ hertz:
   hertz_enable: true
   hardness_Pa: 1.0e10
   plasticity_p0_frac: 1.0
-  hertz_min_h_m: 1.0e-9
+  hertz_min_h_m: 2.0e-10
   hertz_max_frac_of_Pmax: 1.0
   hertz_min_points: 50
-  hertz_iter: 3
+  hertz_iter: 100
   hertz_plot: true
   area_mode: "nominal"
 
@@ -66,7 +66,7 @@ adhesion:
   mu_jkr: 5.0
   min_h_m: 1.0e-10
   max_frac_of_Pmax: 1.0
-  min_points: 10
+  min_points: 150
   n_iter: 100
 
 plotting:
