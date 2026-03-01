@@ -4,28 +4,44 @@ from typing import Optional
 @dataclass(frozen=True)
 class Config:
     # core
-    pattern: str = "*.CSV"
+    pattern: str = "*.csv"
     batch: str = None
     outdir: str = "results"
     time_col: str = "Time"
     markers_col: str = "Markers"
+    daq_hz: float = 500
 
     # raw normal channels
     Fz_raw_col: str = "Force"
     z_raw_col: str = "Displacement"
     x_raw_col: str = "Displacement 2"
 
+    # vertical support spring cal. fallbacks
+    k_sup_z_fallback: Optional[float] = 550  # N/m
+    b_sup_z_fallback: float = 0.             # N -this is the const. term of linear fit of dynamic-force-disp.
+    allow_no_cal_z: bool = True
+
     # vertical stiffness
     Sz_col: str = "Dyn. Stiffness"
     # optional vertical lock-in (RMS) if available for calibration sanity check
     Fz_dyn_rms_col: Optional[str] = "Dyn. Force" 
-    Z_dyn_rms_col: Optional[str] = "Dyn. Disp."    
+    Z_dyn_rms_col: Optional[str] = "Dyn. Disp."   
+    PHI_col: Optional[str] = "Dyn. Phase" 
 
     # touch detection
     k_touch_col: str = "Dyn. Stiffness"
     k_touch_min: float = 500.0
-    k_touch_min_duration_s: float = 0.1
+    k_touch_min_duration_s: float = 0.5
+    touch_mc_n: int = 100
     marker_surface: str = "Surface Index"
+    touch_slope_window_s: float = 0.15
+    touch_baseline_frac: float = 0.10
+    touch_offset_seconds: float = 0.5
+    touch_offset_margin_s: float = 0.5
+    touch_ignore_first_s: float = 10.0
+    touch_baseline_window_s: float = 3.0   # use last 3s before i_start to define baseline k0
+    touch_k_nsigma: float = 6.0           # how many sigmas above baseline to call “touch”
+    touch_require_monotonic_z: bool = False
 
     # lateral lock-in channels (RMS)
     F2_rms_col: str = "Dyn. Force 2"
@@ -59,8 +75,8 @@ class Config:
 
     # --- Uncertainty inputs (1-sigma) ---
     # normal channels
-    sigma_Fz_N: float = 5e-9          # example: 5 nN
-    sigma_z_m: float = 1e-9           # example: 1 nm
+    sigma_Fz_N: float = 5e-9          # +/-5 nN
+    sigma_z_m: float = 1e-9           # +/- 1 nm
 
     # lateral amplitude / friction force channel
     sigma_Ft_N: float = 10e-9         # ~10 nN typical noise per lock-in τ
@@ -85,9 +101,9 @@ class Config:
     # lateral calibration markers (preferred)
     marker_cal_up: str = "dynLRampUp"
     marker_cal_dn: str = "dynLRampDown"
-    k_sup_x_fallback: Optional[float] = None  # N/m
-    b_sup_x_fallback: float = 0.0             # N
-    allow_no_cal: bool = False
+    k_sup_x_fallback: Optional[float] = 250  # N/m
+    c_sup_x_fallback: float = 0.11           # Ns/m 
+    allow_no_cal: bool = True
 
     # fallback lateral calibration heuristic if markers missing
     cal_force_thr_rms: float = 0.01

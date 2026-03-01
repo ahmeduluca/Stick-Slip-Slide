@@ -52,10 +52,14 @@ def make_folder_summary_plots(
     df = df.dropna(subset=["cycle"])
     df["cycle"] = df["cycle"].astype(int)
 
-    if max_cycle_to_plot is None:
-        max_cycle_to_plot = int(df["cycle"].max())
-    else:
-        max_cycle_to_plot = int(max(1, max_cycle_to_plot))
+    try:
+        if max_cycle_to_plot is None:
+            max_cycle_to_plot = int(df["cycle"].max())
+        else:
+            max_cycle_to_plot = int(max(1, max_cycle_to_plot))
+    except:
+        print("no cycles to plot!")
+        return figs
 
     # Helpful base columns (may not exist in all runs)
     for c in ["mu_ss", "tau_ss_MPa", "pressure_ref_GPa", "A_ref_um2", "A_ratio_to_ref", "mu_hold", "mindlin_t_N", "mindlin_a_N_per_m"]:
@@ -250,18 +254,19 @@ def plot_check_friction_and_transitions(
     axlfd1.set_ylabel("Energy Loss per cycle (MeV)")
 
 
-    picks=[]
+    #picks= (i_ss, i_rs)
+    picks = []
     if i_ss is not None:
         picks.append(i_ss)
-    if i_rs is not None:
+    if i_ss is not None and i_rs is not None:
         picks.append(i_rs)
 
     fig = plt.figure(figsize=(10, 6))
     plt.clf()
     ax1 = plt.gca()
-    ax1.plot(tt, Ftt * 1e3, label="Friction force amp (mN)  [F2_pk_corr]")
+    ax1.plot(tt, Ftt * 1e3, label="Lateral load amplitude on sample (mN)")
     ax1.set_xlabel("Time (s)")
-    ax1.set_ylabel("Friction force amplitude (mN)")
+    ax1.set_ylabel("Lateral force amplitude (mN)")
 
     # key boundaries
     ax1.axvline(t[b.i_start], linestyle="--", linewidth=1, label="cycle start", color="black")
@@ -269,21 +274,25 @@ def plot_check_friction_and_transitions(
     ax1.axvline(t[b.i_end], linestyle="--", linewidth=1, label="cycle end", color="black")
     ax1.axvspan(t[b.i_hold0], t[b.i_hold1], alpha=0.15, label="hold window")
     line1, line2 = None, None
+    vlines=[]
     if i_ss is not None:
         line1 = ax1.axvline(t[i_ss], linewidth=2, label="stick→slide", color="red")
+        vlines.append(ax1.axvline(t[i_ss], linewidth=2, linestyle="--", color="red"))
     if i_rs is not None:
         line2 = ax1.axvline(t[i_rs], linewidth=2, label="re-stick", color="green")
+        if i_ss is not None:
+            vlines.append(ax1.axvline(t[i_rs], linewidth=2, linestyle="--", color="green"))
 
     ax2 = ax1.twinx()
     ax2.plot(tt, Ktt, label=r"$ S_{x} (N/m)$", color="orange")
     ax2.set_ylabel("Lateral stiffness (N/m)")
 
     # show Sx_stuck and threshold as horizontals
-    Sx_stuck = tr.get("Sx_stuck", np.nan)
-    Sx_thresh = tr.get("Sx_slide_used", np.nan)
-    if np.isfinite(Sx_stuck):
+    Sx_stuck = tr.get("Sx_stuck", None)
+    Sx_thresh = tr.get("Sx_slide_used", None)
+    if Sx_stuck is not None:
         ax2.axhline(Sx_stuck, linestyle="--", linewidth=1, label="Sx_stuck")
-    if np.isfinite(Sx_thresh):
+    if Sx_thresh is not None:
         ax2.axhline(Sx_thresh, linestyle=":", linewidth=1, label="Sx_thresh", color="red")
 
     # combined legend
@@ -294,7 +303,6 @@ def plot_check_friction_and_transitions(
     plt.tight_layout()
 
 #### Check for stick->slip and restick transitions -interactive
-    vlines = []
     msg = ax1.text(0.01, 0.99, "", transform=ax1.transAxes, va="top")
     prompts = ["Select the stick->slip", "Select the restick", "All set!"]
     def update_msg():
@@ -308,10 +316,10 @@ def plot_check_friction_and_transitions(
         i = int(np.argmin(np.abs(t - x)))
         picks.append(i)
         if len(picks) == 1:
-            vl = ax1.axvline(t[i], linewidth=2, label="stick→slide", color="red")
+            vl = ax1.axvline(t[i], linewidth=2, linestyle = "--", label="stick→slide", color="red")
             vlines.append(vl)
         elif len(picks) == 2:
-            vl = ax1.axvline(t[i], linewidth=2, label="re-stick", color="green")
+            vl = ax1.axvline(t[i], linewidth=2, linestyle = "--", label="re-stick", color="green")
             vlines.append(vl)
         update_msg()
 
@@ -466,6 +474,14 @@ def plot_hertz_diagnostic(h_m, P_N, fit: dict,
     plt.xlabel("h (nm)")
     plt.ylabel("R_app (µm)")
     plt.title(f"{title} — apparent radius vs depth")
+
+    # 4) Load vs Depth
+    figures.append(plt.figure(figsize=(9, 6)))
+    plt.clf()
+    plt.plot(h_m[mask]*1e9, P_N[mask]*1e3, "o")
+    plt.xlabel("h (nm)")
+    plt.ylabel("Load (mN)")
+    plt.title(f"{title} — load vs depth")
     plt.tight_layout()
 
     # 3) plasticity check: p0(h)
@@ -785,9 +801,10 @@ def choose_area_mode_gate(figures : List[plt.Figure] = [], default_mode: str = "
 def draw_vline(ax, x, label="", **kw):
     if x is None or not np.isfinite(x):
         return
-    ax.axvline(x, linestyle="--", color="red", **kw)
+    line = ax.axvline(x, linestyle="--", color="red", **kw)
     ax.text(x, 0.98, label, transform=ax.get_xaxis_transform(),
             va="top", ha="left", fontsize=9)
+    return line
 
 def draw_span(ax, x0, x1, label="", **kw):
     if x0 is None or x1 is None:
@@ -841,13 +858,15 @@ def pick_indices_from_plot(
     ax.legend(loc="best")
     ax.set_xlabel("Time (s)")
     ax.set_title(title)
+    anchor = []
+    vlines = []
     for i in predefined_picks: 
-        draw_vline(ax, t[i])  # just to set up the axis
+        anchor.append(draw_vline(ax, t[i]))  # just to set up the axis
+        vlines.append(draw_vline(ax, t[i]))  # just to set up the axis
     if n_clicks == 2 and predefined_picks is not None and len(predefined_picks) == 2:
         draw_span(ax, t[predefined_picks[0]], t[predefined_picks[1] ])
 
     picks: List[int] = list(predefined_picks) if predefined_picks is not None else []
-    vlines = []
 
     msg = ax.text(0.01, 0.99, "", transform=ax.transAxes, va="top")
     def update_msg():
@@ -911,6 +930,7 @@ def sanity_plot_window_cycles(
     cfg: Config,
     t: np.ndarray,
     P_contact_N: np.ndarray,
+    depth: np.ndarray,
     i0: int,
     i1: int,
     cycles: List[CycleBounds],
@@ -1011,5 +1031,34 @@ def sanity_plot_window_cycles(
     ax.set_title(title or "Lateral envelope and detected cycles")
     ax.legend(loc="upper right")
     plt.tight_layout()
+
+# ----- Plot D: Load-Force vs Depth-Displacement standard check for offsets  -----
+    force = _num(df2, cfg.Fz_raw_col)
+    displ = _num(df2, cfg.z_raw_col)
+    depth = depth*1e9
+    figures.append(plt.figure("Sanity D: Vertical subtractions check", figsize=(10, 5)))
+    plt.clf()
+    ax = plt.gca()
+    ax.plot(displ, force, label="raw Force-Disp")
+    ax.plot(depth, P_contact_N*1e3, label="Load Depth")
+    # calibration slice shading
+    if cal_sl is not None:
+        ax.axvspan(displ[cal_sl.start], displ[cal_sl.stop - 1], alpha=0.15, label="calibration slice", color="green")
+
+    # shear window shading
+    ax.axvspan(displ[i0], displ[i1], alpha=0.10, label="shear window", color="red")
+
+    # cycles
+    for cb in cycles:
+        ax.axvline(displ[cb.i_start], linestyle="--", linewidth=1)
+        ax.axvline(displ[cb.i_peak], linestyle=":", linewidth=1)
+        ax.axvline(displ[cb.i_end], linestyle="--", linewidth=1)
+
+    ax.set_xlabel("Displacement (nm)")
+    ax.set_ylabel("Force (mN)")
+    ax.set_title(title or "Load-Depth calibrations")
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+
     return figures
 

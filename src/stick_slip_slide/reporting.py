@@ -3,11 +3,11 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from .config import Config
-from .math_utils import (robust_median, _num, keep_longest_contiguous)
-from .signal_processing import window_idx_fw
+from .math_utils import (robust_median, _num, keep_longest_contiguous, lockin_regime_stats)
+from .signal_processing import (window_idx_fw, harmonics_energy_regime_dict)
 from .cycle_types import CycleBounds
 from .mechanics import (normal_pressure_Pa, shear_stress_Pa, estimate_lockin_lag_force_sigma,
-                          sigma_shear_strength, area_pi_h_R)
+                          sigma_shear_strength, area_pi_h_R, a_from_stiffness_Sneddon)
 from .fitting import mindlin_fit
 
 # ============================================================
@@ -244,8 +244,8 @@ def build_wide_summary_like_template(all_cycles_df: pd.DataFrame) -> pd.DataFram
 
         # Vertical stiffness: initial + per cycle
         # initial vertical stiffness = S_z_N_per_m from file summary (copied into each cycle row)
-        if "Sz_initial_N_per_m" in g.columns and np.isfinite(g["Sz_initial_N_per_m"].iloc[0]):
-            r["Initial Vertical Stiffness"] = float(g["Sz_initial_N_per_m"].iloc[0])
+        if "Sz_ref_N_per_m" in g.columns and np.isfinite(g["Sz_ref_N_per_m"].iloc[0]):
+            r["Initial Vertical Stiffness"] = float(g["Sz_ref_N_per_m"].iloc[0])
 
         for cyc, col in [(1,"1st Cycle Sliding Vertical Stiffness"), (2,"2nd Cycle Sliding Vertical Stiffness"), (3,"3rd Cycle Sliding Vertical Stiffness")]:
             gg = g[g["cycle"] == cyc]
@@ -321,18 +321,35 @@ def build_wide_summary_dynamic(all_cycles_df: pd.DataFrame, summaries_df: pd.Dat
 
     # which cycle-level columns to spread
     cycle_cols = [c for c in [
-        "Ft_ss_mN","mu_ss","tau_ss_MPa","tau_ss_ci95_lo_MPa","tau_ss_ci95_hi_MPa","X_ss_nm",
-        "Ft_rs_mN","mu_rs","tau_rs_MPa","tau_rs_ci95_lo_MPa","tau_rs_ci95_hi_MPa","X_rs_nm",
-        "sigma_tau_ss_MPa","sigma_Ft_ss_uN","sigma_tau_rs_MPa","sigma_Ft_rs_uN",
+        "Ft_ss_mN","mu_ss","sigma_mu_ss","tau_ss_MPa","tau_ss_ci95_lo_MPa","tau_ss_ci95_hi_MPa","tau_ss_sigma_MPa","X_ss_nm",
+        "Ft_rs_mN","mu_rs", "sigma_mu_rs","tau_rs_MPa","tau_rs_ci95_lo_MPa","tau_rs_ci95_hi_MPa","tau_rs_sigma_MPa","X_rs_nm",
+        "sigma_Ft_ss_uN","sigma_Ft_rs_uN",
         "Sx_stuck_N_per_m","Sx_thresh_N_per_m",
         "Sz_sliding","A_ratio_to_ref","K_ratio_to_ref",
         "mindlin_a_N_per_m","mindlin_t_N","mindlin_rmse","mindlin_ok",
         "mindlin_a_rd_N_per_m","mindlin_t_rd_N","mindlin_rmse_rd","mindlin_ok_rd",
         "total_sliding_time_s", "total_osc_cycles", "total_slide_dist_m", "max_instantaneous_speed_m_per_s",
-        "mean_instantaneous_speed_m_per_s", "overall_mean_speed_m_per_s",
+        "mean_instantaneous_speed_m_per_s", "overall_mean_speed_m_per_s", "f0" "ru_cX_li_over_fft_med",
+        "ru_f0_est_med_Hz", "ru_Tw_s", "ru_E_li_tot_J", "ru_P_li_mean_W", "ru_E1_li_mean_J_per_cycle", "ru_E_harm_fft_cal_med_J_per_cycle",
+        "ru_E_nl_star_med_J_per_cycle", "ru_P_harm_fft_cal_mean_W", "ru_E_consistency_cal_minus_li_tot_J",
+        "ru_E_consistency_cal_minus_li_frac", "ru_X1st_fft_med_nm","ru_X2nd_fft_med_nm", "ru_X3rd_fft_med_nm",
+        "ru_THD_fft_med","ru_E_aug_fft_med_J_per_cycle",
+        "ru_dx_hyst_med_m", "ru_dx_hyst_rel_med","ru_f0_fft_med_Hz","ru_E_aug_fft_tot_J","ru_P_aug_fft_mean_W",
+        "hold_cX_li_over_fft_med",
+        "hold_f0_est_med_Hz", "hold_Tw_s", "hold_E_li_tot_J", "hold_P_li_mean_W", "hold_E1_li_mean_J_per_cycle", 
+        "hold_E_harm_fft_cal_med_J_per_cycle", "hold_E_nl_star_med_J_per_cycle", "hold_P_harm_fft_cal_mean_W", 
+        "hold_E_consistency_cal_minus_li_tot_J", "hold_E_consistency_cal_minus_li_frac", "hold_X1st_fft_med_nm",
+        "hold_X2nd_fft_med_nm", "hold_X3rd_fft_med_nm", "hold_THD_fft_med","hold_E_aug_fft_med_J_per_cycle", 
+        "hold_dx_hyst_med_m", "hold_dx_hyst_rel_med","hold_f0_fft_med_Hz",
+        "hold_E_aug_fft_tot_J","hold_P_aug_fft_mean_W",
+        "rd_cX_li_over_fft_med", "rd_f0_est_med_Hz", "rd_Tw_s", "rd_E_li_tot_J", "rd_P_li_mean_W", 
+        "rd_E1_li_mean_J_per_cycle", "rd_E_harm_fft_cal_med_J_per_cycle", "rd_E_nl_star_med_J_per_cycle", "rd_P_harm_fft_cal_mean_W",
+        "rd_E_consistency_cal_minus_li_tot_J", "rd_E_consistency_cal_minus_li_frac","rd_X1st_fft_med_nm",
+        "rd_X2nd_fft_med_nm", "rd_X3rd_fft_med_nm", "rd_THD_fft_med","rd_E_aug_fft_med_J_per_cycle",
+        "rd_dx_hyst_med_m", "rd_dx_hyst_rel_med","rd_f0_fft_med_Hz",
+        "rd_E_aug_fft_tot_J","rd_P_aug_fft_mean_W",
     ] if c in df.columns]
-
-
+    
     # per-file base from summaries_df
     base_cols = [c for c in [
         # identity / status
@@ -346,7 +363,7 @@ def build_wide_summary_dynamic(all_cycles_df: pd.DataFrame, summaries_df: pd.Dat
         "pressure_ref_GPa",
         "pressure_ref_ci95_lo_GPa",
         "pressure_ref_ci95_hi_GPa",
-        "Sz_initial_N_per_m",
+        "Sz_ref_N_per_m",
 
         # Hertz / adhesion fit (per-file)
         "hertz_ok",
@@ -431,45 +448,11 @@ def summarize_cycle(
     phi = df["phi2_rad"].to_numpy()
     Sx = df["Stiffness_lateral"].to_numpy()
     Dx = df["Damping_lateral"].to_numpy()
-    Ed = df["E_diss_J_per_cycle"].to_numpy()
-    E_total = df["E_diss_total_J"].to_numpy()
-    P_total = df["P_diss_fn_W"].to_numpy()
-    X_1st = df["X1st_pk"].to_numpy()
-    X_2nd = df["X2nd_pk"].to_numpy()
-    E_augment = df["E_diss_aug12_total_J"].to_numpy()
-    Energy_distort = df["E_extra2_over_E1"].to_numpy()
+    Xraw = df[cfg.x_raw_col].to_numpy()
 
     A_ref_m2 = A_ref
     Sx_ref = 0.0 ##lateral stiffness at reference point-for stuck lateral stiffness before-after comparison
     
-    ###Calculations over sliding period averages of each cycle. -normal direction values are just for reference info
-    ##not gonna be used for any direct calculations as they are prone to noise and drift.
-    P_hold = robust_median(P_contact_N[hold])
-    h_hold = robust_median(h_m[hold])
-    A_hold = robust_median(A_m2[hold])
-    Sz_hold = robust_median(Sz[hold])
-
-    ## values to be calculated by median over hold period
-    Ft_hold = robust_median(Ft[hold])
-    X_hold = robust_median(Xc[hold])
-    phi_hold = robust_median(phi[hold])
-    Sx_hold = robust_median(Sx[hold])
-    Dx_hold = robust_median(Dx[hold])
-
-    ##energy-dissipations
-    Ed_hold = robust_median(Ed[hold])
-    Etot_hold = robust_median(E_total[hold])
-    Ptot_hold = robust_median(P_total[hold])
-    X1st_hold = robust_median(X_1st[hold])
-    X2nd_hold = robust_median(X_2nd[hold])
-    E_ratio_hold = robust_median(Energy_distort[hold])
-    E_totaug_hold = robust_median(E_augment)
-
-    # Derived hold quantities
-    mu_hold = Ft_hold / P_hold if (np.isfinite(Ft_hold) and np.isfinite(P_hold) and P_hold > 0) else np.nan
-    p_hold_GPa = (normal_pressure_Pa(np.array([P_hold]), np.array([A_hold]))[0] / 1e9) if (np.isfinite(A_hold) and A_hold > 0 and np.isfinite(P_hold)) else np.nan
-    tau_hold_MPa = (shear_stress_Pa(np.array([Ft_hold]), np.array([A_hold]))[0] / 1e6) if (np.isfinite(A_hold) and A_hold > 0 and np.isfinite(Ft_hold)) else np.nan
-
     ##Sz between cycles for reference junction growth calcs:
     ##Sz_cycle calculations to obtain A_hold; (Sz_cycle/Sz_ref)^2 = A_hold/A_ref
     Sz_end_of_cycle = robust_median(Sz[between]) if (Sz is not None and between.size > 0) else np.nan
@@ -528,13 +511,13 @@ def summarize_cycle(
     if "sigma_Ft_ss_TF_N" in tr and np.isfinite(tr["sigma_Ft_ss_TF_N"]):
         sigma_Ft_ss = np.sqrt(sigma_Ft_ss**2 + float(tr["sigma_Ft_ss_TF_N"])**2)
 
-    # tau uncertainty
-    if sigma_A is not None and i_ss is not None and (0 <= i_ss < len(A_m2)):
-        A_ss = float(A_m2[i_ss]) if np.isfinite(i_ss) else np.nan
-        sA_ss = float(sigma_A[i_ss]) if np.isfinite(i_ss) else np.nan
-        s_tau_ss = sigma_shear_strength(Ft_ss_N, A_ss, sigma_Ft_ss, sA_ss) / 1e6  # -> MPa
-    else:
-        s_tau_ss = np.nan
+    # # tau uncertainty
+    # if sigma_A is not None and i_ss is not None and (0 <= i_ss < len(A_m2)):
+    #     A_ss = float(A_m2[i_ss]) if np.isfinite(i_ss) else np.nan
+    #     sA_ss = float(sigma_A[i_ss]) if np.isfinite(i_ss) else np.nan
+    #     s_tau_ss = sigma_shear_strength(Ft_ss_N, A_ss, sigma_Ft_ss, sA_ss) / 1e6  # -> MPa
+    # else:
+    #     s_tau_ss = np.nan
 
     sigma_Ft_rs = Ft_sig_base
     if (i_rs is not None) and np.isfinite(i_rs):
@@ -545,13 +528,13 @@ def summarize_cycle(
     # if TF correction residual estimated, add it:
     if "sigma_Ft_rs_TF_N" in tr and np.isfinite(tr["sigma_Ft_rs_TF_N"]):
         sigma_Ft_rs = np.sqrt(sigma_Ft_rs**2 + float(tr["sigma_Ft_rs_TF_N"])**2)
-    # tau uncertainty
-    if sigma_A is not None and i_rs is not None and (0 <= i_rs < len(A_m2)):
-        A_rs = float(A_m2[i_rs]) if np.isfinite(i_rs) else np.nan
-        sA_rs = float(sigma_A[i_rs]) if np.isfinite(i_rs) else np.nan
-        s_tau_rs = sigma_shear_strength(Ft_rs_N, A_rs, sigma_Ft_rs, sA_rs) / 1e6  # -> MPa
-    else:
-        s_tau_rs = np.nan
+    # # tau uncertainty
+    # if sigma_A is not None and i_rs is not None and (0 <= i_rs < len(A_m2)):
+    #     A_rs = float(A_m2[i_rs]) if np.isfinite(i_rs) else np.nan
+    #     sA_rs = float(sigma_A[i_rs]) if np.isfinite(i_rs) else np.nan
+    #     s_tau_rs = sigma_shear_strength(Ft_rs_N, A_rs, sigma_Ft_rs, sA_rs) / 1e6  # -> MPa
+    # else:
+    #     s_tau_rs = np.nan
     
     # Mindlin fit windows
     if i_ss is not None: # and i_ss > b.i_peak:
@@ -596,12 +579,6 @@ def summarize_cycle(
     else:
         mind = {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(np.sum(m0)), "ok": 0}
 
-    Ed_ru = robust_median(Ed[sel_slice])
-    Etot_ru = robust_median(E_total[sel_slice])
-    Ptot_ru = robust_median(P_total[sel_slice])
-    E_ratio_ru = robust_median(Energy_distort[sel_slice])
-    E_totaug_ru = robust_median(E_augment[sel_slice])
-
     # ---------------- Ramp-down ----------------
     Q0 = Ft[idx1]
     K0 = Sx[idx1]
@@ -630,13 +607,60 @@ def summarize_cycle(
         }
     else:
         mind_rd = {"a": np.nan, "t": np.nan, "rmse": np.nan, "n": int(np.sum(m0)), "ok": 0}
-    
-    Ed_rs = robust_median(Ed[sel_slice_rd])
-    Etot_rs = robust_median(E_total[sel_slice_rd])
-    Ptot_rs = robust_median(P_total[sel_slice_rd])
-    E_ratio_rs = robust_median(Energy_distort[sel_slice_rd])
-    E_totaug_rs = robust_median(E_augment[sel_slice_rd])
-    
+    hold = slice(sel_slice.stop, sel_slice_rd.start) if sel_slice.stop> sel_slice_rd.start else hold
+    ###Calculations over sliding period averages of each cycle. -normal direction values are just for reference info
+    ##not gonna be used for any direct calculations as they are prone to noise and drift.
+    P_hold = robust_median(P_contact_N[hold])
+    h_hold = robust_median(h_m[hold])
+    A_hold = robust_median(A_m2[hold])
+    Sz_hold = robust_median(Sz[hold])
+
+    ## values to be calculated by median over hold period
+    Ft_hold = robust_median(Ft[hold])
+    X_hold = robust_median(Xc[hold])
+    phi_hold = robust_median(phi[hold])
+    Sx_hold = robust_median(Sx[hold])
+    Dx_hold = robust_median(Dx[hold])
+
+    # Derived hold quantities
+    mu_hold = Ft_hold / P_hold if (np.isfinite(Ft_hold) and np.isfinite(P_hold) and P_hold > 0) else np.nan
+    p_hold_GPa = (normal_pressure_Pa(np.array([P_hold]), np.array([A_hold]))[0] / 1e9) if (np.isfinite(A_hold) and A_hold > 0 and np.isfinite(P_hold)) else np.nan
+    tau_hold_MPa = (shear_stress_Pa(np.array([Ft_hold]), np.array([A_hold]))[0] / 1e6) if (np.isfinite(A_hold) and A_hold > 0 and np.isfinite(Ft_hold)) else np.nan
+
+    harm_ru = harmonics_energy_regime_dict(
+        t=t,
+        x_raw=Xraw,
+        Kpp=Dx,                         # Damping_lateral array
+        X_lockin_pk=Xc,                 # X2_pk_contact_m array (peak, from lock-in)
+        Ft_pk=Ft,                       # F2_pk_corr_N array (peak)
+        sl=sel_slice,
+        f1_guess_hz=float(cfg.dyn_f2_freq_Hz),
+        prefix="ru",                 # avoids collisions
+    )
+    lia_stats_ru = lockin_regime_stats(sl = sel_slice, prefix="ru", F_pk=Ft, X_pk=Xc, phi=phi, Kp=Sx, Kpp=Dx)
+    harm_hold = harmonics_energy_regime_dict(
+        t=t,
+        x_raw=Xraw,
+        Kpp=Dx,                         # Damping_lateral array
+        X_lockin_pk=Xc,                 # X2_pk_contact_m array (peak, from lock-in)
+        Ft_pk=Ft,                       # F2_pk_corr_N array (peak)
+        sl=hold,
+        f1_guess_hz=float(cfg.dyn_f2_freq_Hz),
+        prefix="hold",                 # avoids collisions
+    )
+    lia_stats_hold = lockin_regime_stats(sl = hold, prefix="hold", F_pk=Ft, X_pk=Xc, phi=phi, Kp=Sx, Kpp=Dx)
+    harm_rd = harmonics_energy_regime_dict(
+        t=t,
+        x_raw=Xraw,
+        Kpp=Dx,                         # Damping_lateral array
+        X_lockin_pk=Xc,                 # X2_pk_contact_m array (peak, from lock-in)
+        Ft_pk=Ft,                       # F2_pk_corr_N array (peak)
+        sl=sel_slice_rd,
+        f1_guess_hz=float(cfg.dyn_f2_freq_Hz),
+        prefix="rd",                 # avoids collisions
+    )
+    lia_stats_rd = lockin_regime_stats(sl = sel_slice_rd, prefix="rd", F_pk=Ft, X_pk=Xc, phi=phi, Kp=Sx, Kpp=Dx)
+
     return {
         "cycle": b.cycle,
         "t_start_s": float(t[b.i_start]),
@@ -659,13 +683,6 @@ def summarize_cycle(
         "phi_hold_rad": float(phi_hold) if np.isfinite(phi_hold) else np.nan,
         "Sliding_lateral_stiffness": float(Sx_hold),
         "Damping_lateral": float(Dx_hold),
-        "E_diss_J_per_cycle_hold": float(Ed_hold),
-        "E_diss_1st_harmonic_J": float(Etot_hold),
-        "P_diss_1st_harmonic_W": float(Ptot_hold),
-        "E_ratio_1st_2nd": float(E_ratio_hold),
-        "E_diss_augmented_J": float(E_totaug_hold),
-        "X1st_median_nm": float(X1st_hold),
-        "X2nd_median_nm": float(X2nd_hold),
 
         # friction + shear (hold)
         "mu_hold": float(mu_hold) if np.isfinite(mu_hold) else np.nan,
@@ -678,17 +695,11 @@ def summarize_cycle(
         "X_rs_nm": float(X_rs_m * 1e9) if np.isfinite(X_rs_m) else np.nan,
         "mu_ss": float(mu_ss) if np.isfinite(mu_ss) else np.nan,
         "mu_rs": float(mu_rs) if np.isfinite(mu_rs) else np.nan,
-        ##"tau_ss_MPa": float(tau_ss_MPa) if np.isfinite(tau_ss_MPa) else np.nan,
-        ##"tau_rs_MPa": float(tau_rs_MPa) if np.isfinite(tau_rs_MPa) else np.nan,
-        "Sx_stuck_N_per_m": float(tr.get("Sx_stuck", np.nan)),
-        "Sx_thresh_N_per_m": float(tr.get("Sx_slide_used", np.nan)),
 
-        "X1st_pk_nm_ru": float(X_1st[i_ss]),
-        "X2nd_pk_nm_ru": float(X_2nd[i_ss]),
+        "Sx_stuck_N_per_m": float(tr.get("Sx_stuck", np.nan)) if tr.get("Sx_stuck") is not None else np.nan,
+        "Sx_thresh_N_per_m": float(tr.get("Sx_slide_used", np.nan)) if tr.get("Sx_slide_used") is not None else np.nan,
 
-        "sigma_tau_ss_MPa" : float(s_tau_ss) if np.isfinite(s_tau_ss) else np.nan,
         "sigma_Ft_ss_uN" : float(sigma_Ft_ss * 1e6) if np.isfinite(sigma_Ft_ss) else np.nan,
-        "sigma_tau_rs_MPa" : float(s_tau_rs) if np.isfinite(s_tau_rs) else np.nan,
         "sigma_Ft_rs_uN" : float(sigma_Ft_rs * 1e6) if np.isfinite(sigma_Ft_rs) else np.nan,
 
         # junction growth proxies
@@ -703,12 +714,6 @@ def summarize_cycle(
         "mindlin_n": int(mind.get("n", 0)),
         "mindlin_ok": int(mind.get("ok", 0)),
         "mindlin_region": sel_slice,
-        
-        "E_diss_J_per_cycle_ru": float(Ed_ru),
-        "E_diss_1st_harmonic_J_ru": float(Etot_ru),
-        "P_diss_1st_harmonic_W_ru": float(Ptot_ru),
-        "E_ratio_1st_2nd_ru": float(E_ratio_ru),
-        "E_diss_augmented_J_ru": float(E_totaug_ru),
         ## mindlin ramp-down
         "mindlin_a_rd_N_per_m": float(mind_rd.get("a", np.nan)),
         "mindlin_t_rd_N": float(mind_rd.get("t", np.nan)),
@@ -717,11 +722,13 @@ def summarize_cycle(
         "mindlin_ok_rd": int(mind_rd.get("ok", 0)),
         "mindlin_rd_region": sel_slice_rd,
 
-        "E_diss_J_per_cycle_rs": float(Ed_rs),
-        "E_diss_1st_harmonic_J_rs": float(Etot_rs),
-        "P_diss_1st_harmonic_W_rs": float(Ptot_rs),
-        "E_ratio_1st_2nd_rs": float(E_ratio_rs),
-        "E_diss_augmented_J_rs": float(E_totaug_rs),
+        ## energy outputs
+        **harm_ru,
+        **lia_stats_ru,
+        **harm_hold,
+        **lia_stats_hold,
+        **harm_rd,
+        **lia_stats_rd
     }
 
 def build_Aref_samples(
@@ -730,6 +737,8 @@ def build_Aref_samples(
     A_ref: float,
     h_ref: float,
     P_ref: float,
+    Sz_ref: float|None = None,
+    sigma_Sz_ref: float|None = None,
     E_star_Pa: float,
     cfg,
     hertz: dict | None,
@@ -762,6 +771,9 @@ def build_Aref_samples(
         where a_flat captures baseline/flat-punch-like stiffness leakage and R_eff captures
         the Hertz-like scaling part. Both are extracted from the SAME flat_end fit, so their
         uncertainties can be correlated.
+    (3) fallback -nominal-:
+        1- by stiffness (if exists)
+        2- by initial depth (if exists)
 
     Correlation-aware sampling:
     ---------------------------
@@ -777,6 +789,9 @@ def build_Aref_samples(
     n = int(n_fallback)
 
     rho_thr = float(getattr(cfg, "ref_unc_rho_thr", 0.3))
+    min_boot_ok = int(getattr(cfg, "ref_unc_min_boot_ok", 50))   # NEW: accept boot if >= this many
+    max_attempts_ok = int(getattr(cfg, "ref_unc_max_attempts_ok", 999999))  # NEW: optional cap
+    fallback_cv = float(getattr(cfg, "ref_unc_fallback_cv", 0.20))          # NEW: 20% CV if no sigma
 
     diag: dict = {
         "area_mode_used": str(area_mode_used),
@@ -784,19 +799,51 @@ def build_Aref_samples(
         "n_samples": int(n),
         "seed": int(seed),
         "rho_thr": float(rho_thr),
+        "min_boot_ok": int(min_boot_ok),
+        "fallback_cv": float(fallback_cv),
     }
 
     def _resample(x: np.ndarray, n_: int) -> np.ndarray:
         return rng.choice(x, size=int(n_), replace=True)
 
+    def _lognormal_around(mean_pos: float, cv: float, n_: int) -> np.ndarray:
+        # mean>0, cv>=0; returns positive samples with approx given mean and CV
+        m = float(mean_pos)
+        cv = float(max(0.0, cv))
+        if not (np.isfinite(m) and m > 0):
+            return np.full(int(n_), np.nan)
+        if cv == 0:
+            return np.full(int(n_), m)
+        sigma2 = np.log(1.0 + cv * cv)
+        mu = np.log(m) - 0.5 * sigma2
+        return np.exp(rng.normal(mu, np.sqrt(sigma2), size=int(n_)))
+
     # -----------------------
-    # nominal path (instrument/geometry uncertainty already collapsed into sigma_A_ref)
+    # nominal path
     # -----------------------
     if mode.startswith("nominal"):
         diag["path"] = "nominal"
-        if sigma_A_ref is None:
+
+        # NEW: nominal stiffness-based sampling
+        if "stiff" in mode:
+            Sz0 = float(Sz_ref) if (Sz_ref is not None) else np.nan
+            sSz = float(sigma_Sz_ref) if (sigma_Sz_ref is not None) else np.nan
+            diag["Sz_ref"] = Sz0 if np.isfinite(Sz0) else np.nan
+            diag["sigma_Sz_ref"] = sSz if np.isfinite(sSz) else np.nan
+
+            if np.isfinite(Sz0) and (Sz0 > 0) and np.isfinite(sSz) and (sSz > 0):
+                Sz_samp = _gauss_positive(rng, Sz0, sSz, n)
+                a_samp = a_from_stiffness_Sneddon(Sz_samp, float(E_star_Pa))
+                A_samp = np.pi * a_samp * a_samp
+                return _clamp_area(A_samp, amin=np.pi*(getattr(cfg,"area_min_radius_m",5e-9)**2)), diag
+
+            # if stiffness stats not available, fall back to sigma_A_ref or scalar below
+
+        # Existing nominal_depth behavior
+        if sigma_A_ref is None or not (np.isfinite(sigma_A_ref) and sigma_A_ref > 0):
             diag["fallback_used"] = "A_ref_scalar"
             return np.full(n, float(A_ref)), diag
+
         return _gauss_positive(rng, float(A_ref), float(sigma_A_ref), n), diag
 
     # -----------------------
@@ -805,49 +852,51 @@ def build_Aref_samples(
     if mode == "fit_hertz":
         diag["path"] = "fit_hertz"
 
-        # ---- use bootstrap if present ----
+        # try bootstrap if present and good enough
         if boot_hertz and int(boot_hertz.get("ok", 0)) == 1:
             s = boot_hertz.get("samples", {}) or {}
             R = _clean_pos(s.get("R_eff_m", None))
-            diag["boot_hertz_n_boot_ok"] = int(boot_hertz.get("n_boot_ok", R.size))
+
+            n_ok = int(boot_hertz.get("n_boot_ok", R.size))
+            n_att = int(boot_hertz.get("n_attempts", n_ok))
+
+            diag["boot_hertz_n_boot_ok"] = int(n_ok)
+            diag["boot_hertz_n_attempts"] = int(n_att)
             diag["boot_hertz_R_n"] = int(R.size)
 
-            # checkpoint: adhesion model stability under resampling
             if "adhesion_model_used_mode" in boot_hertz:
                 diag["adhesion_model_used_mode"] = boot_hertz.get("adhesion_model_used_mode")
             if "adhesion_model_used_frac" in boot_hertz:
                 diag["adhesion_model_used_frac"] = float(boot_hertz.get("adhesion_model_used_frac"))
 
-            # optional correlation checkpoints if extra fields are present
-            # (These don't change A unless you later propagate those too, but they're valuable diagnostics.)
-            for k in ("w_eff_J_per_m2", "Fadh_N", "z0_m"):
-                if k in s:
-                    x = np.asarray(s[k], float)
-                    m = np.isfinite(x) & np.isfinite(s.get("R_eff_m", np.nan))
-                    # recompute with aligned, positive R only
-                    Rraw = np.asarray(s.get("R_eff_m", np.nan), float)
-                    mm = m & np.isfinite(Rraw) & (Rraw > 0)
-                    xx = x[mm]
-                    RR = Rraw[mm]
-                    if xx.size > 10:
-                        rho = float(np.corrcoef(RR, xx)[0, 1])
-                        diag[f"hertz_corr_R_{k}"] = float(rho) if np.isfinite(rho) else np.nan
+            boot_good = (R.size >= min_boot_ok) and (n_att <= max_attempts_ok)
+            diag["boot_hertz_good"] = bool(boot_good)
 
             if R.size > 10:
-                R_pick = _resample(R, n)
-                A = area_pi_h_R(np.full(n, float(h_ref)), R_pick)
-                return _clamp_area(A), diag
+                if boot_good:
+                    diag["fallback_used"] = None
+                    R_pick = _resample(R, n)
+                    A = area_pi_h_R(np.full(n, float(h_ref)), R_pick)
+                    return _clamp_area(A), diag
+                else:
+                    # weak boot: still use it but top up with conservative jitter
+                    diag["fallback_used"] = "weak_boot_topped"
+                    R_pick = _resample(R, n)
+                    A = area_pi_h_R(np.full(n, float(h_ref)), R_pick)
+                    # add multiplicative jitter to avoid overconfidence
+                    A *= _lognormal_around(1.0, 0.10, n)  # 10% jitter
+                    return _clamp_area(A), diag
 
-        # ---- fallback: deterministic from main fit dict ----
+        # deterministic from main fit, but with conservative spread (no zero-uncertainty!)
         Rm = float(hertz.get("R_eff_m", np.nan)) if hertz else np.nan
         diag["hertz_R_eff_m"] = float(Rm) if np.isfinite(Rm) else np.nan
         if np.isfinite(Rm) and Rm > 0:
-            A = area_pi_h_R(np.full(n, float(h_ref)), np.full(n, Rm))
-            diag["fallback_used"] = "hertz_main_fit_R_only"
-            return _clamp_area(A), diag
+            diag["fallback_used"] = "hertz_main_fit_plus_cv"
+            A0 = float(area_pi_h_R(np.array([float(h_ref)]), np.array([Rm]))[0])
+            return _clamp_area(_lognormal_around(A0, fallback_cv, n)), diag
 
-        diag["fallback_used"] = "A_ref_scalar"
-        return np.full(n, float(A_ref)), diag
+        diag["fallback_used"] = "A_ref_scalar_plus_cv"
+        return _clamp_area(_lognormal_around(float(A_ref), fallback_cv, n)), diag
 
     # -----------------------
     # flat_end path
@@ -855,68 +904,46 @@ def build_Aref_samples(
     if mode == "flat_end":
         diag["path"] = "flat_end"
 
-        if not (boot_flat and int(boot_flat.get("ok", 0)) == 1):
-            diag["fallback_used"] = "A_ref_scalar"
-            return np.full(n, float(A_ref)), diag
+        if boot_flat and int(boot_flat.get("ok", 0)) == 1:
+            s = boot_flat.get("samples", {}) or {}
+            a_raw = np.asarray(s.get("a_flat_m", []), float)
+            R_raw = np.asarray(s.get("R_eff_m", []), float)
 
-        s = boot_flat.get("samples", {}) or {}
+            m = np.isfinite(a_raw) & (a_raw > 0) & np.isfinite(R_raw) & (R_raw > 0)
+            a = a_raw[m]
+            R = R_raw[m]
+            diag["flat_pair_n"] = int(a.size)
 
-        # Paired arrays from same bootstrap draw (important!)
-        a_raw = np.asarray(s.get("a_flat_m", []), float)
-        R_raw = np.asarray(s.get("R_eff_m", []), float)
+            if a.size > 10:
+                rho = float(np.corrcoef(a, R)[0, 1]) if a.size >= 2 else 0.0
+                if not np.isfinite(rho):
+                    rho = 0.0
+                diag["flat_corr_a_R"] = float(rho)
 
-        m = np.isfinite(a_raw) & (a_raw > 0) & np.isfinite(R_raw) & (R_raw > 0)
-        a = a_raw[m]
-        R = R_raw[m]
-        diag["flat_pair_n"] = int(a.size)
+                use_pairing = (abs(rho) >= rho_thr)
+                diag["flat_use_pairing"] = bool(use_pairing)
 
-        if a.size > 10 and R.size > 10:
-            rho = float(np.corrcoef(a, R)[0, 1]) if a.size >= 2 else 0.0
-            if not np.isfinite(rho):
-                rho = 0.0
-            diag["flat_corr_a_R"] = float(rho)
+                if use_pairing:
+                    j = rng.integers(0, a.size, size=n)
+                    a_pick = a[j]
+                    R_pick = R[j]
+                else:
+                    a_pick = _resample(a, n)
+                    R_pick = _resample(R, n)
 
-            use_pairing = (abs(rho) >= rho_thr)
-            diag["flat_use_pairing"] = bool(use_pairing)
+                A_flat = np.pi * a_pick * a_pick
+                A_hz = area_pi_h_R(np.full(n, float(h_ref)), R_pick)
+                return _clamp_area(A_flat + A_hz), diag
 
-            if use_pairing:
-                j = rng.integers(0, a.size, size=n)
-                a_pick = a[j]
-                R_pick = R[j]
-            else:
-                a_pick = _resample(a, n)
-                R_pick = _resample(R, n)
+        # no / weak flat bootstrap -> use A_ref with spread (NOT constant)
+        if sigma_A_ref is not None and np.isfinite(sigma_A_ref) and sigma_A_ref > 0:
+            diag["fallback_used"] = "flat_missing_use_sigmaA"
+            return _clamp_area(_gauss_positive(rng, float(A_ref), float(sigma_A_ref), n)), diag
 
-            A_flat = np.pi * a_pick * a_pick
-            A_hz = area_pi_h_R(np.full(n, float(h_ref)), R_pick)
-            return _clamp_area(A_flat + A_hz), diag
+        diag["fallback_used"] = "flat_missing_use_cv"
+        return _clamp_area(_lognormal_around(float(A_ref), fallback_cv, n)), diag
 
-        # fallback: deterministic medians (robust) for missing/short bootstrap samples
-        a0 = _summ_median(boot_flat.get("a_flat_m", None))
-        if not (np.isfinite(a0) and a0 > 0):
-            a0 = _robust_center(s.get("a_flat_m", None))
-
-        R0 = _summ_median(boot_flat.get("R_eff_m", None))
-        if not (np.isfinite(R0) and R0 > 0):
-            R0 = _robust_center(s.get("R_eff_m", None))
-
-        diag["flat_corr_a_R"] = np.nan
-        diag["flat_use_pairing"] = False
-        diag["fallback_used"] = "flat_medians"
-        diag["flat_a0_m"] = float(a0) if np.isfinite(a0) else np.nan
-        diag["flat_R0_m"] = float(R0) if np.isfinite(R0) else np.nan
-
-        if (np.isfinite(a0) and a0 > 0) and (np.isfinite(R0) and R0 > 0):
-            A_flat = np.full(n, np.pi * float(a0) * float(a0))
-            A_hz = area_pi_h_R(np.full(n, float(h_ref)), np.full(n, float(R0)))
-            return _clamp_area(A_flat + A_hz), diag
-
-        diag["fallback_used"] = "A_ref_scalar"
-        return np.full(n, float(A_ref)), diag
-
-    # -----------------------
-    # unknown mode -> deterministic
-    # -----------------------
+    # unknown mode
     diag["path"] = "unknown_mode"
-    diag["fallback_used"] = "A_ref_scalar"
-    return np.full(n, float(A_ref)), diag
+    diag["fallback_used"] = "unknown_use_cv"
+    return _clamp_area(_lognormal_around(float(A_ref), fallback_cv, n)), diag

@@ -73,7 +73,7 @@ def load_config_yaml(path: str | Path) -> Config:
     if "k_sup_x" in core:
         updates["k_sup_x"] = float(core["k_sup_x"])
     if "b_sup_x" in core:
-        updates["b_sup_x"] = float(core["b_sup_x"])
+        updates["c_sup_x"] = float(core["c_sup_x"])
     if "allow_no_cal" in core:
         updates["allow_no_cal"] = bool(core["allow_no_cal"])
         

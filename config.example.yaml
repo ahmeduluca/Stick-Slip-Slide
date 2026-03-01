@@ -1,22 +1,22 @@
 core:
-  tip_radius_um: 5.0
+  tip_radius_um: 1.0
   k_frame_z: 450000.0
   k_frame_x: 200000.0
   pattern: "*.csv"
   outdir: "results"
-  k_sup_x_fallback: 450.0 # N/m
-  b_sup_x_fallback: 0.0 # N s/m
+  k_sup_x_fallback: 250.0 # N/m
+  c_sup_x_fallback: 0.11 # Ns/m
   allow_no_cal: True
 
 touch:
-  k_touch_min: 500.0
+  k_touch_min: 600.
   k_touch_min_duration_s: 0.1
   loading_rate_threshold: 0.001
   normal_load_sustain: 0.5
-  normal_load_smooth: 501
+  normal_load_smooth: 201
 
 cycles:
-  smooth_n: 101
+  smooth_n: 51
   dynF2_baseline_q: 0.01
   dynF2_active_delta: 0.01
   dynF2_nearzero_delta: 0.005
@@ -33,7 +33,7 @@ cycles:
 transition:
   trans_frac_up: 0.1
   trans_frac_down: 0.15
-  sliding_lateral_stiffness_thresh: 500.0
+  sliding_lateral_stiffness_thresh: 500.
   resticking_lateral_stiffness_thresh: 600.0
   trans_low_band: [0.05, 0.20]
   trans_smooth_n: 21
@@ -45,9 +45,9 @@ hertz:
   hertz_min_h_m: 2.0e-10
   hertz_max_frac_of_Pmax: 1.0
   hertz_min_points: 50
-  hertz_iter: 100
+  hertz_iter: 10
   hertz_plot: true
-  area_mode: "nominal"
+  area_mode: "nominal_stiffness"
 
 materials:
   E1_GPa: 70.0
@@ -67,10 +67,10 @@ adhesion:
   min_h_m: 1.0e-10
   max_frac_of_Pmax: 1.0
   min_points: 150
-  n_iter: 100
+  n_iter: 10
 
 plotting:
-  manual_mode: "on_fail"
+  manual_mode: "always"
   manual_cycle_mode: "always"
   plot_mindlin: true
   plot_cycles: true

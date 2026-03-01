@@ -1,5 +1,5 @@
 import inspect
-from typing import List, Tuple
+from typing import List, Tuple, Any
 import numpy as np
 import pandas as pd
 
@@ -27,6 +27,140 @@ def robust_median(x: np.ndarray) -> float:
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     return float(np.median(x)) if x.size else np.nan
+
+def robust_mad(x: np.ndarray, *, scale_to_sigma: bool = True) -> float:
+    """
+    Robust scatter from Median Absolute Deviation (MAD).
+
+    If scale_to_sigma=True (default), returns an estimate comparable to 1σ
+    for Gaussian-like noise: sigma ≈ 1.4826 * MAD.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.nan
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    if scale_to_sigma:
+        return float(1.4826 * mad)
+    return float(mad)
+
+def lockin_regime_stats(
+    *,
+    sl: slice,
+    prefix: str = "",
+    # Any lock-in channels
+    F_pk: np.ndarray | None = None,
+    X_pk: np.ndarray | None = None,
+    phi: np.ndarray | None = None,
+    Kp: np.ndarray | None = None,
+    Kpp: np.ndarray | None = None,
+    # Optional: allow additional named channels without changing signature
+    extras: dict[str, np.ndarray] | None = None,
+    # Optional: compute derived ratio stats if possible
+    compute_ratio_R: bool = True,
+) -> dict[str, Any]:
+    """
+    Robust per-slice statistics for lock-in channels.
+
+    - Works with any subset of provided arrays.
+    - Returns only computed keys.
+    - Uses MAD-based robust sigma: sigma ~= 1.4826 * median(|x - median(x)|).
+    - If both F_pk and X_pk provided, can compute ratio R=F/X and its propagated sigma
+      (based on slice-level sigma_F and sigma_X, assuming independence).
+
+    Keys (if inputs exist):
+      <prefix>F_pk_med, <prefix>sigma_F_pk
+      <prefix>X_pk_med, <prefix>sigma_X_pk
+      <prefix>phi_med, <prefix>sigma_phi
+      <prefix>Kp_med, <prefix>sigma_Kp
+      <prefix>Kpp_med, <prefix>sigma_Kpp
+      <prefix>R_med, <prefix>sigma_R   (if compute_ratio_R and F & X exist)
+      <prefix>n_used (always, if slice valid)
+    """
+
+    def _p(k: str) -> str:
+        return f"{prefix}_{k}" if prefix else k
+
+    out: dict[str, Any] = {}
+
+    if sl is None:
+        return out
+
+    i0 = int(sl.start) if sl.start is not None else 0
+    i1 = int(sl.stop) if sl.stop is not None else 0
+    if i1 <= i0:
+        return out
+
+    idx = np.arange(i0, i1)
+
+    def _robust_med_sigma(a: np.ndarray | None) -> tuple[float, float, int]:
+        if a is None:
+            return (np.nan, np.nan, 0)
+        x = np.asarray(a, float)
+        if x.size == 0:
+            return (np.nan, np.nan, 0)
+        # slice safely
+        idx_clip = idx[(idx >= 0) & (idx < x.size)]
+        if idx_clip.size < 3:
+            return (np.nan, np.nan, int(idx_clip.size))
+        xs = x[idx_clip]
+        xs = xs[np.isfinite(xs)]
+        if xs.size < 3:
+            return (np.nan, np.nan, int(xs.size))
+        med = float(np.median(xs))
+        mad = float(np.median(np.abs(xs - med)))
+        sig = float(1.4826 * mad)  # Gaussian-equivalent sigma
+        return (med, sig, int(xs.size))
+
+    # Collect core stats
+    n_used_list = []
+
+    for name, arr in [
+        ("F_pk", F_pk),
+        ("X_pk", X_pk),
+        ("phi", phi),
+        ("Kp", Kp),
+        ("Kpp", Kpp),
+    ]:
+        if arr is None:
+            continue
+        med, sig, n_used = _robust_med_sigma(arr)
+        out[_p(f"{name}_med")] = med
+        out[_p(f"sigma_{name}")] = sig
+        n_used_list.append(n_used)
+
+    # Extras: any other channels (e.g., "F_rms", "X_rms", "Sx", "Dx", etc.)
+    if extras:
+        for key, arr in extras.items():
+            med, sig, n_used = _robust_med_sigma(arr)
+            out[_p(f"{key}_med")] = med
+            out[_p(f"sigma_{key}")] = sig
+            n_used_list.append(n_used)
+
+    # Always report how many finite samples were used (best-effort)
+    if n_used_list:
+        out[_p("n_used")] = int(np.max(n_used_list))
+    else:
+        # nothing finite provided
+        out[_p("n_used")] = 0
+        return out
+
+    # Derived ratio R = F/X (optional)
+    if compute_ratio_R and (F_pk is not None) and (X_pk is not None):
+        Fm = out.get(_p("F_pk_med"), np.nan)
+        Xm = out.get(_p("X_pk_med"), np.nan)
+        sF = out.get(_p("sigma_F_pk"), np.nan)
+        sX = out.get(_p("sigma_X_pk"), np.nan)
+
+        if np.isfinite(Fm) and np.isfinite(Xm) and (Xm != 0):
+            Rm = float(Fm / Xm)
+            # Propagate using slice-level sigmas (independence assumption)
+            sR = np.sqrt((sF / Xm) ** 2 + ((Fm * sX) / (Xm ** 2)) ** 2) if (np.isfinite(sF) and np.isfinite(sX)) else np.nan
+            out[_p("R_med")] = Rm
+            out[_p("sigma_R")] = float(sR) if np.isfinite(sR) else np.nan
+
+    return out
 
 def rolling_median(x: np.ndarray, n: int) -> np.ndarray:
     n = max(1, int(n))
@@ -59,19 +193,62 @@ def phase_to_rad(phi: np.ndarray) -> np.ndarray:
         return np.deg2rad(phi)
     return phi
 
-def robust_fit_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-    m = np.isfinite(x) & np.isfinite(y)
+def robust_fit_line_origin(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    ## this is used only for support spring linear term, no offsets allowed.
+    m = np.isfinite(x) & np.isfinite(y) & (x > 0)
     x = x[m]; y = y[m]
     if x.size < 10:
-        return (np.nan, np.nan)
+        return (np.nan, 0.0)
+
     qlo, qhi = np.quantile(x, [0.05, 0.95])
     mm = (x >= qlo) & (x <= qhi)
     if mm.sum() >= 10:
         x2, y2 = x[mm], y[mm]
     else:
         x2, y2 = x, y
-    a, b = np.polyfit(x2, y2, 1)
-    return float(a), float(b)
+
+    # Least-squares slope through origin: a = (x·y)/(x·x)
+    denom = float(np.dot(x2, x2))
+    a = float(np.dot(x2, y2) / denom) if denom > 0 else np.nan
+
+    if np.isfinite(a) and a < 0:
+        a = np.nan
+
+    return float(a), 0.0
+
+def robust_fit_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    m = np.isfinite(x) & np.isfinite(y)
+    x = np.asarray(x, float)[m]
+    y = np.asarray(y, float)[m]
+
+    if x.size < 10:
+        return (np.nan, np.nan)
+
+    # Trim extremes in x
+    qlo, qhi = np.quantile(x, [0.05, 0.95])
+    mm = (x >= qlo) & (x <= qhi)
+
+    if mm.sum() >= 10:
+        x2, y2 = x[mm], y[mm]
+    else:
+        x2, y2 = x, y
+
+    # Degenerate guard: if x barely varies, slope is meaningless
+    x_span = float(np.nanmax(x2) - np.nanmin(x2))
+    if (not np.isfinite(x_span)) or (x_span <= 0):
+        return (np.nan, np.nan)
+
+    # polyfit can warn/overflow on ill-conditioned inputs; catch & return nan
+    try:
+        a, b = np.polyfit(x2, y2, 1)
+    except Exception:
+        return (np.nan, np.nan)
+
+    a = float(a); b = float(b)
+    if (not np.isfinite(a)) or (not np.isfinite(b)):
+        return (np.nan, np.nan)
+
+    return (a, b)
 
 def window_idx(t: np.ndarray, center_i: int, halfwidth_s: float) -> np.ndarray:
     t0 = t[center_i]
@@ -176,18 +353,88 @@ def tau_from_samples(Ft_mN: float, A_samples: np.ndarray, eps: float = EPS_A) ->
     tau = tau[np.isfinite(tau)]
     return tau
 
-def tau_nominal_with_sigma(Ft_mN, A_m2, sigma_A_m2=None):
-    if (not np.isfinite(Ft_mN)) or (Ft_mN <= 0) or \
-    (not np.isfinite(A_m2)) or (A_m2 <= EPS_A):
+EPS_A = 1e-24  # m^2 (small-area guard)
+EPS_F = 1e-30  # mN  (small-force guard for relative error)
+
+def tau_nominal_with_sigma(Ft_mN, A_m2, sigma_A_m2=None, sigma_Ft_mN=None):
+    """
+    Nominal shear stress tau = Ft/A in MPa, with 1-sigma via standard propagation.
+
+    Inputs
+    ------
+    Ft_mN : float
+        Tangential force in mN
+    A_m2 : float
+        Area in m^2.
+    sigma_A_m2 : float or None
+        1-sigma uncertainty of area in m^2.
+    sigma_Ft_mN : float or None
+        1-sigma uncertainty of force in mN.
+
+    Returns
+    -------
+    (tau_MPa, sigma_tau_MPa)
+    """
+    # basic validity guards
+    if (not np.isfinite(Ft_mN)) or (not np.isfinite(A_m2)) or (A_m2 <= EPS_A):
         return (np.nan, np.nan)
 
-    tau_MPa = (Ft_mN * 1e-3) / A_m2 / 1e6
+    # nominal tau
+    tau_MPa = (Ft_mN * 1e-3) / A_m2 / 1e6  # = Ft_mN * 1e-9 / A_m2
 
-    if np.isfinite(sigma_A_m2) and sigma_A_m2 > 0:
-        sigma_tau = tau_MPa * (sigma_A_m2 / A_m2)
-    else:
-        sigma_tau = np.nan
+    # If tau is ~0, relative propagation is ill-conditioned; return nan
+    if not np.isfinite(tau_MPa):
+        return (np.nan, np.nan)
+
+    # build relative variance from whichever sigmas are provided
+    rel_var = 0.0
+    any_sigma = False
+
+    if (sigma_Ft_mN is not None) and np.isfinite(sigma_Ft_mN) and (sigma_Ft_mN > 0):
+        denomF = max(abs(Ft_mN), EPS_F)
+        rel_var += (sigma_Ft_mN / denomF) ** 2
+        any_sigma = True
+
+    if (sigma_A_m2 is not None) and np.isfinite(sigma_A_m2) and (sigma_A_m2 > 0):
+        rel_var += (sigma_A_m2 / A_m2) ** 2
+        any_sigma = True
+
+    sigma_tau = abs(tau_MPa) * np.sqrt(rel_var) if any_sigma else np.nan
     return (tau_MPa, sigma_tau)
+
+def inflate_tau_uncertainty_with_force(
+    *,
+    tau_med_Pa: float,
+    ci95_lo_Pa: float,
+    ci95_hi_Pa: float,
+    Ft_mN: float,
+    sigma_Ft_mN: float | None,
+    ci95_to_sigma,
+    sigma_to_ci95,
+):
+    """
+    Combine area-derived tau uncertainty (from ci95) with independent force uncertainty.
+
+    Assumes:
+      - tau distribution already includes A uncertainty (via sampling A).
+      - force uncertainty is symmetric (1-sigma) and independent of A.
+
+    Returns
+    -------
+    sigma_total_Pa, (ci95_lo2_Pa, ci95_hi2_Pa)
+    """
+    # area-only sigma inferred from existing CI
+    sigma_Aonly_Pa = ci95_to_sigma(tau_med_Pa, ci95_lo_Pa, ci95_hi_Pa)
+    sigma_total_Pa = sigma_Aonly_Pa
+
+    if (sigma_Ft_mN is not None) and np.isfinite(sigma_Ft_mN) and (sigma_Ft_mN > 0) and np.isfinite(Ft_mN):
+        Fabs = abs(Ft_mN)
+        if Fabs > EPS_F and np.isfinite(tau_med_Pa):
+            sigma_Fterm_Pa = abs(tau_med_Pa) * (sigma_Ft_mN / Fabs)
+            sigma_total_Pa = float(np.sqrt(sigma_Aonly_Pa**2 + sigma_Fterm_Pa**2))
+
+    ci_lo2_Pa, ci_hi2_Pa = sigma_to_ci95(tau_med_Pa, sigma_total_Pa)
+    return sigma_total_Pa, (ci_lo2_Pa, ci_hi2_Pa)
 
 # ---------- sigma -> CI95 ----------
 def sigma_to_ci95(mean: float, sigma: float):

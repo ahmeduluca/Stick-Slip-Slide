@@ -7,14 +7,14 @@ import pandas as pd
 import inspect
 from .config import Config
 
-from .math_utils import (_num, robust_fit_line, rms_to_peak,
-    robust_fit_line,
-    safe_nanmax,
-    safe_nanmin,
+from .math_utils import (
+    _num, 
+    rms_to_peak,
+    robust_fit_line_origin,
+    robust_fit_line
 )
 
 from .mechanics import (
-    # physics kernels (make these public in mechanics.py)
     hertz_load_from_h,
     jkr_P_from_h,
     tabor_mu,
@@ -150,26 +150,90 @@ def fit_support_spring_pre_touch(
     z_m: np.ndarray,
     F_N: np.ndarray,
     touch_i: int,
+    cfg,
     *,
-    min_points: int = 50
-) -> tuple[float, float, float, float]:
+    min_points: int = 50,
+) -> tuple[float, float, float, float, dict]:
     """
-    Fit pre-touch support spring: F ≈ k*z + b.
-    Returns k,b,sigma_k,sigma_b.
+    Fit pre-touch support spring F ≈ k*z + b on a *selected* pre-touch window.
+
+    Returns k,b,sigma_k,sigma_b,meta
     """
-    z = np.asarray(z_m[:touch_i], float)
-    F = np.asarray(F_N[:touch_i], float)
+    z = np.asarray(z_m, float)
+    F = np.asarray(F_N, float)
 
-    if np.isfinite(z).sum() < min_points or np.isfinite(F).sum() < min_points:
-        raise RuntimeError("Not enough pre-touch points to fit support spring.")
+    # --- time->index mapping (optional) ---
+    # If you have time array available here, pass it; otherwise use daq_hz approximation.
+    daq_hz = float(getattr(cfg, "daq_hz", 500.0))
+    ignore_s = float(getattr(cfg, "touch_ignore_first_s", 0.0) or 0.0)
+    margin_s = float(getattr(cfg, "touch_fit_margin_s", 0.2) or 0.2)  # stay away from contact
 
-    k, b = robust_fit_line(z, F)
-    if not np.isfinite(k):
-        raise RuntimeError("Support spring fit failed.")
+    i0 = int(max(0, round(ignore_s * daq_hz)))
+    i1 = int(max(i0, touch_i - round(margin_s * daq_hz)))
 
-    _, _, sigma_k, sigma_b = ols_line_cov(z, F)
-    return float(k), float(b), float(sigma_k), float(sigma_b)
+    # Guard
+    if touch_i is None or touch_i <= 10 or i1 - i0 < min_points:
+        raise RuntimeError("Not enough pre-touch points after ignore/margin for support spring fit.")
 
+    zz = z[i0:i1]
+    FF = F[i0:i1]
+    m = np.isfinite(zz) & np.isfinite(FF)
+    if m.sum() < min_points:
+        raise RuntimeError("Not enough paired pre-touch points (finite) to fit support spring.")
+
+    zz = zz[m]
+    FF = FF[m]
+
+    # --- conditioning guard: require real z-span ---
+    z_span = float(np.nanmax(zz) - np.nanmin(zz))
+    z_span_min = float(getattr(cfg, "touch_fit_min_z_span_m", 50e-9))  # 50 nm default
+    if not np.isfinite(z_span) or z_span < z_span_min:
+        raise RuntimeError(
+            f"Pre-touch fit window z-span too small ({z_span:.3e} m < {z_span_min:.3e} m). "
+            "k_sup becomes ill-conditioned."
+        )
+
+    # --- optional: null in-window to reduce intercept-driven µN bias ---
+    # (recommended for low-load)
+    use_origin_fit = bool(getattr(cfg, "touch_fit_force_origin", True))
+    if use_origin_fit:
+        # center using robust medians
+        z0 = float(np.nanmedian(zz))
+        F0 = float(np.nanmedian(FF))
+        zc = zz - z0
+        Fc = FF - F0
+
+        Szz = float(np.dot(zc, zc))
+        if (not np.isfinite(Szz)) or Szz <= 0:
+            raise RuntimeError("Support fit ill-conditioned (Szz ~ 0).")
+
+        k = float(np.dot(zc, Fc) / Szz)
+        b = float(F0 - k * z0)
+    else:
+        # your existing robust fit
+        k, b = robust_fit_line(zz, FF)
+
+    # sanity: support stiffness should be positive
+    if (not np.isfinite(k)) or (k <= 0):
+        if getattr(cfg, "k_sup_z_fallback", None) is not None and np.isfinite(cfg.k_sup_z_fallback):
+            k = float(cfg.k_sup_z_fallback)
+            b = float(getattr(cfg, "b_sup_z_fallback", 0.0))
+        elif getattr(cfg, "allow_no_cal_z", False):
+            k = 0.0
+            b = 0.0
+        else:
+            raise RuntimeError("Support spring calibration failed and no fallback provided.")
+        
+    _, _, sigma_k, sigma_b = ols_line_cov(zz, FF)
+
+    meta = dict(
+        i0=i0, i1=i1, n_used=int(len(zz)),
+        z_span_m=z_span,
+        use_origin_fit=bool(use_origin_fit),
+        k_sup_N_per_m=float(k),
+        b_sup_N=float(b),
+    )
+    return float(k), float(b), float(sigma_k), float(sigma_b), meta
 def fit_vertical_dynamic_support_spring(
     df: pd.DataFrame,
     cfg: Config,
@@ -194,7 +258,7 @@ def fit_vertical_dynamic_support_spring(
     Fz_pk = rms_to_peak(Fz_rms)
     Z_pk  = rms_to_peak(Z_rms)
 
-    k, b = robust_fit_line(Z_pk[cal_sl_vert], Fz_pk[cal_sl_vert])  # F ≈ k*Z + b
+    k, b = robust_fit_line_origin(Z_pk[cal_sl_vert], Fz_pk[cal_sl_vert])  # F ≈ k*Z + b
     return (float(k), float(b))
 
 def fit_vertical_dynamic_coupling(
@@ -203,48 +267,41 @@ def fit_vertical_dynamic_coupling(
     scale_to_SI: Dict[str, float],
     cal_sl_vert: Optional[slice],
 ) -> dict:
-    """
-    Fit a 2D linear model on the vertical dyn calibration bump:
-      Fz_pk ≈ kzz*Z_pk + kzx*X2_pk + b
-    Returns dict with kzz, kzx, b, and R2-like metric.
-    """
     if cal_sl_vert is None:
-        return {"kzz": np.nan, "kzx": np.nan, "b": np.nan, "ok": 0}
+        return {"kzz": np.nan, "kzx": np.nan, "b": 0.0, "ok": 0}
 
-    # need vertical dyn force+disp and lateral dyn disp
     need = [cfg.Fz_dyn_rms_col, cfg.Z_dyn_rms_col, cfg.X2_rms_col]
     if any((c is None) or (c not in df.columns) for c in need):
-        return {"kzz": np.nan, "kzx": np.nan, "b": np.nan, "ok": 0}
+        return {"kzz": np.nan, "kzx": np.nan, "b": 0.0, "ok": 0}
 
-    Fz = rms_to_peak(_num(df, cfg.Fz_dyn_rms_col) * scale_to_SI[cfg.Fz_dyn_rms_col])
-    Z  = rms_to_peak(_num(df, cfg.Z_dyn_rms_col)  * scale_to_SI[cfg.Z_dyn_rms_col])
-    X2 = rms_to_peak(_num(df, cfg.X2_rms_col)     * scale_to_SI[cfg.X2_rms_col])
+    Fz = np.abs(rms_to_peak(_num(df, cfg.Fz_dyn_rms_col) * scale_to_SI[cfg.Fz_dyn_rms_col]))
+    Z  = np.abs(rms_to_peak(_num(df, cfg.Z_dyn_rms_col)  * scale_to_SI[cfg.Z_dyn_rms_col]))
+    X2 = np.abs(rms_to_peak(_num(df, cfg.X2_rms_col)     * scale_to_SI[cfg.X2_rms_col]))
 
     sl = cal_sl_vert
-    y = Fz[sl]
-    X = np.column_stack([Z[sl], X2[sl], np.ones_like(y)])
+    y = np.asarray(Fz[sl], float)
+    A = np.column_stack([np.asarray(Z[sl], float), np.asarray(X2[sl], float)])
 
-    m = np.isfinite(y) & np.isfinite(X).all(axis=1)
-    if m.sum() < 20:
-        return {"kzz": np.nan, "kzx": np.nan, "b": np.nan, "ok": 0}
+    m = np.isfinite(y) & np.isfinite(A).all(axis=1)
+    y = y[m]; A = A[m]
+    if y.size < 20:
+        return {"kzz": np.nan, "kzx": np.nan, "b": 0.0, "ok": 0}
 
-    y = y[m]
-    X = X[m]
+    # Solve min ||A*[kzz,kzx] - y|| (no intercept)
+    beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+    kzz, kzx = beta.tolist()
 
-    # least squares
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    kzz, kzx, b = beta.tolist()
-
-    yhat = X @ beta
+    # Simple fit quality
+    yhat = A @ beta
     ss_res = float(np.sum((y - yhat) ** 2))
     ss_tot = float(np.sum((y - np.mean(y)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
 
-    return {"kzz": float(kzz), "kzx": float(kzx), "b": float(b), "r2": float(r2), "ok": 1}
-
+    return {"kzz": float(kzz), "kzx": float(kzx), "b": 0.0, "r2": float(r2), "ok": 1}
 
 # ---------------------------------------------------------------------
 # 3) Hertz radius fit with adhesion + optional stiffness regularizer
+#    (optimized: early-stop + no prints + faster JKR search + leverages fast jkr_P_from_h)
 # ---------------------------------------------------------------------
 def hertz_fit_radius_adhesion(
     h_m: np.ndarray,
@@ -267,8 +324,19 @@ def hertz_fit_radius_adhesion(
     Sz_meas_N_per_m: np.ndarray | None = None,
     dh_stiff_m: float = 0.25e-9,
     stiff_wt: float = 0.0,
+    # ---- new knobs (safe defaults) ----
+    debug: bool = False,
+    early_stop_rel: float = 1e-4,   # relative R change
+    jkr_use_scipy: bool = True,     # use scipy bounded minimization if available
 ) -> dict:
     """
+    Optimizations vs old version:
+      - removes unconditional prints (debug flag instead)
+      - early stop when R converges and model stabilizes
+      - JKR: uses bounded 1D minimization if SciPy available, else reduced grid
+      - relies on mechanics.jkr_P_from_h being optimized (replace _jkr_P_from_h with fast Newton+fallback)
+
+    Still:
       - depends only on mechanics public kernels
       - returns mask_used (useful for diagnostics + bootstrap)
     """
@@ -299,10 +367,12 @@ def hertz_fit_radius_adhesion(
     if np.isfinite(Pmax0) and Pmax0 > 0 and (0 < float(max_frac_of_Pmax) < 1.0):
         mask &= (P <= float(max_frac_of_Pmax) * Pmax0)
 
-    if int(np.sum(mask)) < int(min_points):
-        return {"ok": 0, "reason": "not_enough_points", "n_used": int(np.sum(mask))}
+    n_used0 = int(np.sum(mask))
+    if n_used0 < int(min_points):
+        return {"ok": 0, "reason": "not_enough_points", "n_used": n_used0}
 
-    h = h[mask]; P = P[mask]
+    h = h[mask]
+    P = P[mask]
     if Sz is not None:
         Sz = Sz[mask]
 
@@ -310,8 +380,10 @@ def hertz_fit_radius_adhesion(
     w_eff = w_eff_from_roughness(w_J_per_m2, sigma_rms_m, model=rough_model, delta0_m=delta0_m)
     w_eff = float(w_eff) if (np.isfinite(w_eff) and w_eff > 0) else 0.0
 
-    # initial R guess from Hertz slope
+    # precompute x = h^(3/2) for fast Hertz-slope fit
     x = np.power(np.maximum(0.0, h), 1.5)
+
+    # initial R guess from Hertz slope
     if R0_m is not None and np.isfinite(R0_m) and R0_m > 0:
         R = float(R0_m)
     else:
@@ -342,6 +414,7 @@ def hertz_fit_radius_adhesion(
         if model_name == "jkr":
             c_pull = 1.5
             Fadh = c_pull * np.pi * Rm * w_eff
+            # IMPORTANT: relies on mechanics.jkr_P_from_h being the optimized implementation
             return jkr_P_from_h(hh, Rm, E, w_eff, n_bisect=60), c_pull, Fadh
 
         return hertz_load_from_h(hh, Rm, E), 0.0, 0.0
@@ -350,7 +423,8 @@ def hertz_fit_radius_adhesion(
         mm = np.isfinite(y) & np.isfinite(yhat)
         if np.sum(mm) < int(min_points):
             return np.inf
-        return float(np.sqrt(np.mean((y[mm] - yhat[mm]) ** 2)))
+        d = y[mm] - yhat[mm]
+        return float(np.sqrt(np.mean(d * d)))
 
     def _rmse_Sz(Rm: float, model_name: str, mu_val: float) -> tuple[float, int]:
         if Sz is None or not (np.isfinite(dh_stiff_m) and dh_stiff_m > 0):
@@ -365,7 +439,8 @@ def hertz_fit_radius_adhesion(
         n_ok = int(np.sum(mm))
         if n_ok < int(min_points):
             return np.inf, n_ok
-        return float(np.sqrt(np.mean((Sz[mm] - Sz_pred[mm]) ** 2))), n_ok
+        d = Sz[mm] - Sz_pred[mm]
+        return float(np.sqrt(np.mean(d * d))), n_ok
 
     def _fit_R_from_Peff(Peff: np.ndarray) -> float:
         mm = np.isfinite(Peff) & np.isfinite(x) & (x > 0) & (Peff > 0)
@@ -380,7 +455,11 @@ def hertz_fit_radius_adhesion(
     chosen_model = "hertz"
     mu_val = np.nan
 
-    for _ in range(int(max(1, n_iter))):
+    prev_R = None
+    prev_model = None
+
+    for it in range(int(max(1, n_iter))):
+        # model selection
         if model_req == "auto" and w_eff > 0:
             mu_val = tabor_mu(R, w_eff, E, z0_m)
             chosen_model = auto_model_from_mu(mu_val, mu_dmt=mu_dmt, mu_jkr=mu_jkr)
@@ -388,54 +467,91 @@ def hertz_fit_radius_adhesion(
             chosen_model = model_req
             mu_val = tabor_mu(R, w_eff, E, z0_m) if (w_eff > 0) else np.nan
 
+        if debug:
+            print(f"[hertz_fit_radius_adhesion] it={it+1} model={chosen_model} R={R:.4e} w_eff={w_eff:.3e}")
+
+        # early stop (R stable + model stable)
+        if prev_R is not None:
+            rel = abs(R - prev_R) / max(abs(R), 1e-30)
+            if (rel < float(early_stop_rel)) and (chosen_model == prev_model):
+                break
+        prev_R = float(R)
+        prev_model = str(chosen_model)
+
+        # Hertz
         if w_eff <= 0 or chosen_model == "hertz":
             R_new = _fit_R_from_Peff(P)
-            if np.isfinite(R_new): R = 0.5 * R + 0.5 * R_new
+            if np.isfinite(R_new):
+                R = 0.5 * R + 0.5 * R_new
             continue
 
+        # DMT/transition
         if chosen_model in ("dmt", "transition"):
             c_pull = 2.0 if chosen_model == "dmt" else c_from_tabor(mu_val)
             Fadh = c_pull * np.pi * R * w_eff
             Peff = P + Fadh
             R_new = _fit_R_from_Peff(Peff)
-            if np.isfinite(R_new): R = 0.5 * R + 0.5 * R_new
+            if np.isfinite(R_new):
+                R = 0.5 * R + 0.5 * R_new
             continue
 
+        # JKR
         if chosen_model == "jkr":
+            use_stiff = (Sz is not None) and (np.isfinite(stiff_wt) and float(stiff_wt) > 0)
+
+            def obj_R(Rc: float) -> float:
+                Rc = float(max(Rc, 1e-12))
+                P_pred, _, _ = _predict_P(h, Rc, "jkr", mu_val)
+                obj = _rmse(P, P_pred)
+                if use_stiff:
+                    rS, _ = _rmse_Sz(Rc, "jkr", mu_val)
+                    obj = obj + float(stiff_wt) * rS
+                return float(obj)
+
             R_center = float(max(R, 1e-12))
-            grid = R_center * np.logspace(-1.0, 1.0, 31)
+            lo = R_center / 10.0
+            hi = R_center * 10.0
 
             best_R = R_center
             best_obj = np.inf
-            for Rc in grid:
-                P_pred, _, _ = _predict_P(h, Rc, "jkr", mu_val)
-                obj = _rmse(P, P_pred)
-                if Sz is not None and float(stiff_wt) > 0:
-                    rS, _ = _rmse_Sz(Rc, "jkr", mu_val)
-                    obj = obj + float(stiff_wt) * rS
-                if obj < best_obj:
-                    best_obj = obj
-                    best_R = float(Rc)
 
-            grid2 = best_R * np.logspace(-0.3, 0.3, 25)
-            for Rc in grid2:
-                P_pred, _, _ = _predict_P(h, Rc, "jkr", mu_val)
-                obj = _rmse(P, P_pred)
-                if Sz is not None and float(stiff_wt) > 0:
-                    rS, _ = _rmse_Sz(Rc, "jkr", mu_val)
-                    obj = obj + float(stiff_wt) * rS
-                if obj < best_obj:
-                    best_obj = obj
-                    best_R = float(Rc)
+            used_scipy = False
+            if jkr_use_scipy:
+                try:
+                    from scipy.optimize import minimize_scalar
+                    res = minimize_scalar(obj_R, bounds=(lo, hi), method="bounded")
+                    if res.success and np.isfinite(res.x):
+                        best_R = float(res.x)
+                        best_obj = float(res.fun) if np.isfinite(res.fun) else obj_R(best_R)
+                        used_scipy = True
+                except Exception:
+                    used_scipy = False
+
+            if not used_scipy:
+                # Reduced grid vs old (17 + 13 instead of 31 + 25)
+                grid = R_center * np.logspace(-0.8, 0.8, 17)
+                for Rc in grid:
+                    v = obj_R(Rc)
+                    if v < best_obj:
+                        best_obj = v
+                        best_R = float(Rc)
+
+                grid2 = best_R * np.logspace(-0.25, 0.25, 13)
+                for Rc in grid2:
+                    v = obj_R(Rc)
+                    if v < best_obj:
+                        best_obj = v
+                        best_R = float(Rc)
 
             R = 0.5 * R + 0.5 * best_R
             continue
 
         # fallback
         R_new = _fit_R_from_Peff(P)
-        if np.isfinite(R_new): R = 0.5 * R + 0.5 * R_new
+        if np.isfinite(R_new):
+            R = 0.5 * R + 0.5 * R_new
 
-    # final
+    # final model
     if model_req == "auto" and w_eff > 0:
         mu_val = tabor_mu(R, w_eff, E, z0_m)
         chosen_model = auto_model_from_mu(mu_val, mu_dmt=mu_dmt, mu_jkr=mu_jkr)
@@ -450,12 +566,16 @@ def hertz_fit_radius_adhesion(
     if Sz is not None and float(stiff_wt) > 0:
         rmse_Sz_val, n_Sz_used = _rmse_Sz(R, chosen_model, mu_val)
 
-    rmse_combined = rmse_P + (float(stiff_wt) * rmse_Sz_val if (np.isfinite(rmse_Sz_val) and float(stiff_wt) > 0) else 0.0)
+    rmse_combined = rmse_P + (
+        float(stiff_wt) * rmse_Sz_val
+        if (np.isfinite(rmse_Sz_val) and float(stiff_wt) > 0)
+        else 0.0
+    )
 
     return {
         "ok": 1 if (np.isfinite(R) and R > 0 and np.isfinite(rmse_P)) else 0,
         "reason": "",
-        "mask_used": mask,  # keep for diagnostics/plotting/bootstrap
+        "mask_used": mask,
 
         "E_star_Pa": float(E),
         "R_eff_m": float(R),
@@ -980,40 +1100,17 @@ def bootstrap_hertz_radius_uncertainty(
     keep_frac: float = 1.0,
     min_success: int = 30,
     block_size: int | None = 10,
-    # ---- new: collect more coupled outputs for correlation-aware propagation ----
     collect_fields: tuple[str, ...] = ("w_eff_J_per_m2", "Fadh_N", "z0_m"),
+    # ---- anti-stall controls ----
+    max_attempts_factor: float = 8.0,     # max attempts = factor * n_boot
+    early_stop: bool = True,              # stop once we have n_boot successes
+    # ---- optional: improve success rate ----
+    ensure_high_load_frac: float = 0.10,  # force at least this fraction from top-load tail (0 disables)
+    high_load_quantile: float = 0.85,     # define "high load" tail
 ) -> dict:
-    """
-    Bootstrap uncertainty for fitted Hertz/adhesion parameters.
-
-    Physics:
-    --------
-    The Hertz(+adhesion) fitter extracts an effective tip radius R_eff (and, depending
-    on model, adhesion-related quantities like w_eff, Fadh, z0). These parameters are
-    *coupled*: noisy data and model tradeoffs can produce correlated variations across
-    bootstrap resamples.
-
-    Statistics:
-    -----------
-    - We use (block) bootstrap resampling to respect correlation in sequential sweeps.
-    - We store *paired* samples: each bootstrap draw yields one tuple of parameters.
-      This enables correct uncertainty propagation into nonlinear derived quantities
-      and enables correlation diagnostics.
-
-    Returns dict:
-    -------------
-      ok, reason, n_used, n_boot_ok, keep_frac, block_size,
-      R_eff_std_m, R_eff_ci95_lo_m, R_eff_ci95_hi_m,
-      samples: {
-         "R_eff_m": array([...]),
-         <optional fields in collect_fields> : array([...])  # aligned with R_eff draws
-         "adhesion_model_used": array([...]) (dtype=str)
-      },
-      plus: adhesion_model_used_mode / frac if available.
-    """
     fit_kwargs = dict(fit_kwargs or {})
 
-    # ---- Filter kwargs to fit_fn signature to avoid "unexpected kwarg" errors ----
+    # Filter kwargs to fit_fn signature
     try:
         sig = inspect.signature(fit_fn)
         accepted = set(sig.parameters.keys())
@@ -1021,10 +1118,8 @@ def bootstrap_hertz_radius_uncertainty(
     except Exception:
         pass
 
-    # ---- sanitize & align arrays ----
     h = np.asarray(h_m, float)
     P = np.asarray(P_N, float)
-
     if h.shape != P.shape:
         return {"ok": 0, "reason": "shape_mismatch", "n_used": 0, "n_boot_ok": 0,
                 "R_eff_std_m": np.nan, "R_eff_ci95_lo_m": np.nan, "R_eff_ci95_hi_m": np.nan}
@@ -1049,38 +1144,71 @@ def bootstrap_hertz_radius_uncertainty(
                 "n_used": n, "n_boot_ok": 0,
                 "R_eff_std_m": np.nan, "R_eff_ci95_lo_m": np.nan, "R_eff_ci95_hi_m": np.nan}
 
+    # clamp keep_frac
+    kf = float(keep_frac)
+    if not np.isfinite(kf):
+        kf = 1.0
+    kf = max(1e-6, min(1.0, kf))
+
     # sample size per draw
-    msize = int(max(min_points, round(float(keep_frac) * n)))
-    msize = min(msize, n)
+    msize = int(round(kf * n))
+    msize = int(max(min_points, min(msize, n)))
 
     rng = np.random.default_rng(seed)
 
-    # ---- block bootstrap sampler (indices into the filtered arrays) ----
-    def _draw_indices() -> np.ndarray:
-        if (block_size is None) or (int(block_size) <= 1):
-            return rng.integers(0, n, size=msize)
+    # precompute high-load indices (optional)
+    hi_idx = np.array([], dtype=int)
+    if np.isfinite(ensure_high_load_frac) and float(ensure_high_load_frac) > 0:
+        q = float(high_load_quantile)
+        q = min(0.99, max(0.5, q))
+        thr = np.quantile(P, q)
+        hi_idx = np.where(P >= thr)[0]
+        # if tail is tiny, still ok; we’ll just sample whatever exists
 
-        B = int(max(1, block_size))
-        nblocks = int(np.ceil(msize / B))
-        starts = rng.integers(0, max(1, n - B + 1), size=nblocks)
-        idx = np.concatenate([np.arange(s, s + B) for s in starts])
-        return idx[:msize]
+    def _draw_indices() -> np.ndarray:
+        # base draw: iid or block
+        if (block_size is None) or (int(block_size) <= 1):
+            idx = rng.integers(0, n, size=msize)
+        else:
+            B = int(max(1, block_size))
+            nblocks = int((msize + B - 1) // B)
+            starts = rng.integers(0, max(1, n - B + 1), size=nblocks)
+            offs = np.arange(B, dtype=int)
+            idx = (starts[:, None] + offs[None, :]).ravel()[:msize]
+
+        # force some high-load points to prevent low-range pathological subsets
+        if hi_idx.size > 0:
+            frac = float(ensure_high_load_frac)
+            frac = min(1.0, max(0.0, frac))
+            k_hi = int(round(frac * msize))
+            if k_hi >= 1 and hi_idx.size >= 1:
+                replace = (hi_idx.size < k_hi)
+                idx_hi = rng.choice(hi_idx, size=k_hi, replace=replace)
+                # overwrite first k_hi entries (simple + fast)
+                idx[:k_hi] = idx_hi
+
+        return idx
 
     def _call_fit(hb: np.ndarray, Pb: np.ndarray, Szb: np.ndarray | None):
         if Szb is not None:
             return fit_fn(hb, Pb, *fit_args, Sz_meas_N_per_m=Szb, **fit_kwargs)
         return fit_fn(hb, Pb, *fit_args, **fit_kwargs)
 
-    # ---- collect paired samples ----
+    n_boot = int(max(1, n_boot))
+    min_success = int(max(1, min_success))
+
+    # cap attempts to avoid “stuck forever”
+    max_attempts = int(max(50, np.ceil(float(max_attempts_factor) * n_boot)))
+
     R_list: list[float] = []
     model_used: list[str] = []
-
     extra_lists: dict[str, list[float]] = {k: [] for k in collect_fields}
 
-    for _ in range(int(max(10, n_boot))):
+    attempts = 0
+    while attempts < max_attempts:
+        attempts += 1
         idx = _draw_indices()
-        hb = h[idx]
-        Pb = P[idx]
+        hb = h[idx]; Pb = P[idx]
         Szb = Sz[idx] if Sz is not None else None
 
         try:
@@ -1098,19 +1226,22 @@ def bootstrap_hertz_radius_uncertainty(
         R_list.append(float(Rb))
         model_used.append(str(res.get("adhesion_model_used", res.get("adhesion_model", ""))))
 
-        # collect requested coupled fields (store NaN if missing so lengths stay aligned)
         for k in collect_fields:
             vb = res.get(k, np.nan)
             extra_lists[k].append(float(vb) if np.isfinite(vb) else np.nan)
 
+        if early_stop and (len(R_list) >= n_boot):
+            break
+
     R = np.asarray(R_list, float)
     n_ok = int(R.size)
-    if n_ok < int(min_success):
+
+    if n_ok < min_success:
         return {"ok": 0, "reason": "too_few_successful_bootstraps",
-                "n_used": n, "n_boot_ok": n_ok,
+                "n_used": n, "n_boot_ok": n_ok, "n_boot": n_boot, "n_attempts": attempts,
                 "R_eff_std_m": np.nan, "R_eff_ci95_lo_m": np.nan, "R_eff_ci95_hi_m": np.nan}
 
-    R_std = float(np.std(R, ddof=1)) if R.size >= 2 else np.nan
+    R_std = float(np.std(R, ddof=1)) if n_ok >= 2 else np.nan
     lo, hi = np.percentile(R, [2.5, 97.5])
 
     out = {
@@ -1118,14 +1249,14 @@ def bootstrap_hertz_radius_uncertainty(
         "n_used": n,
         "n_boot_ok": n_ok,
         "n_boot": int(n_boot),
-        "keep_frac": float(keep_frac),
+        "n_attempts": int(attempts),
+        "keep_frac": float(kf),
         "block_size": (int(block_size) if (block_size is not None) else None),
 
         "R_eff_std_m": float(R_std),
         "R_eff_ci95_lo_m": float(lo),
         "R_eff_ci95_hi_m": float(hi),
 
-        # Paired raw samples for propagation
         "samples": {
             "R_eff_m": R,
             "adhesion_model_used": np.asarray(model_used, dtype=str),
@@ -1133,7 +1264,6 @@ def bootstrap_hertz_radius_uncertainty(
         }
     }
 
-    # If auto model switches across resamples, report most frequent
     if model_used:
         vals, counts = np.unique(np.asarray(model_used, dtype=str), return_counts=True)
         j = int(np.argmax(counts))
@@ -1141,8 +1271,6 @@ def bootstrap_hertz_radius_uncertainty(
         out["adhesion_model_used_frac"] = float(counts[j] / np.sum(counts))
 
     return out
-
-
 
 def filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
     """Drop kwargs that `fn` does not accept (prevents TypeError on unexpected kwargs)."""

@@ -30,6 +30,8 @@ from .math_utils import (
     sigma_to_ci95,
     add_harmonics_from_raw_x,
     add_energy_totals_and_xraw_harmonics,
+    robust_mad,
+    inflate_tau_uncertainty_with_force,
     EPS_A
 )
 
@@ -37,6 +39,7 @@ from .math_utils import (
 from .signal_processing import (
     detect_touch_index,
     manual_pick_touch,
+    recompute_touch_meta_from_index,
     detect_cycles,
     manual_pick_shear_window,
     manual_pick_cycles,
@@ -62,12 +65,12 @@ from .mechanics import (
     a_from_depth_sphere,
     estimate_R_from_a_and_h,
     estimate_R_from_a_and_P,
-    a_from_Sz,
     A_from_a,
     sigma_P_contact,
     sigma_h_contact,
     sigma_area_piRh,
     compute_area_from_choice,
+    prop_div,
     _finite
 )
 
@@ -110,7 +113,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
       - correct ordering (no undefined vars)
       - optional approval + manual repick gate
       - no overwriting of manually-picked indices
-      - consistent reference window for Sz_initial, h_ref, A_ref
+      - consistent reference window for Sz_ref, h_ref, A_ref
       - safe handling of missing transitions / sliding metrics
       - fixed tau unit conversion
       - Hertz diagnostic on the loading segment (touch -> end-of-loading)
@@ -154,10 +157,22 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     # 1) Touch detection (auto first)
     # -----------------------------
     touch_i = None
+    touch_meta = {}
     auto_ok_touch = True
     err_touch = None
     try:
-        touch_i = detect_touch_index(df, cfg, markers)
+        touch_i, touch_meta = detect_touch_index(df, cfg, scale, markers)
+
+        F0 = touch_meta["F0_mN"]
+        z0 = touch_meta["z0_nm"]
+
+        sigma_F_point = touch_meta["sigma_F_point_used_mN"]   # 10 nN
+        sigma_F0 = touch_meta["sigma_F0_mN"]
+        sigma_P = np.sqrt(sigma_F_point**2 + sigma_F0**2)
+
+        sigma_z_point = touch_meta["sigma_z_point_used_nm"]
+        sigma_z0 = touch_meta["sigma_z0_nm"]
+        sigma_h = np.sqrt(sigma_z_point**2 + sigma_z0**2)    
     except Exception as e:
         auto_ok_touch = False
         err_touch = str(e)
@@ -169,15 +184,18 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     # Helper: compute normal signals given touch_i
     # -----------------------------
     def _compute_normal_signals(_touch_i: int):
-        k_sup_z, b_sup_z, _, _ = fit_support_spring_pre_touch(z_raw_m, Fz_raw_N, _touch_i)
+        k_sup_z, b_sup_z, _, _, meta_vfit = fit_support_spring_pre_touch(z_raw_m, Fz_raw_N, _touch_i, cfg)
+        print(meta_vfit)
         P_contact_N = corrected_normal_load(Fz_raw_N, z_raw_m, k_sup_z, b_sup_z)
-        return k_sup_z, b_sup_z, P_contact_N
+        h_m = contact_depth_h_m(z_raw_m, touch_i, P_contact_N, cfg.k_frame_z)
+        return k_sup_z, b_sup_z, P_contact_N, h_m
 
     # We cannot proceed without a touch index (unless user repicks)
     k_sup_z = b_sup_z = None
     P_contact_N = None
+    h_m = None
     if touch_i is not None:
-        k_sup_z, b_sup_z, P_contact_N = _compute_normal_signals(touch_i)
+        k_sup_z, b_sup_z, P_contact_N, h_m = _compute_normal_signals(touch_i)
 
     # -----------------------------
     # 2) Lateral calibration + df2 (needs touch_i for cal slice search window)
@@ -203,8 +221,9 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     df2 = None
 
     df2, cal_sl_lat, cal_sl_vert, k_sup_z_dyn, b_sup_z_dyn, cpl = _compute_df2(df, cfg, markers, scale, touch_i)
-    df2 = add_harmonics_from_raw_x(df=df2, time_col=cfg.time_col, x_raw_col = cfg.x_raw_col, f1_hz = cfg.dyn_f2_freq_Hz)
-    df2 = add_energy_totals_and_xraw_harmonics(df = df2, time_col=cfg.time_col, f1_hz = cfg.dyn_f2_freq_Hz, x_raw_col = cfg.x_raw_col)
+    if df2 is not None:
+        df2 = add_harmonics_from_raw_x(df=df2, time_col=cfg.time_col, x_raw_col = cfg.x_raw_col, f1_hz = cfg.dyn_f2_freq_Hz)
+        df2 = add_energy_totals_and_xraw_harmonics(df = df2, time_col=cfg.time_col, f1_hz = cfg.dyn_f2_freq_Hz, x_raw_col = cfg.x_raw_col)
     # -----------------------------
     # 3) Shear window + cycles (auto)
     # -----------------------------
@@ -257,6 +276,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
                 cfg=cfg,
                 t=t,
                 P_contact_N=P_contact_N if P_contact_N is not None else np.zeros_like(t),
+                depth=h_m if h_m is not None else np.zeros_like(t),
                 i0=(win[0] if win else None),
                 i1=(win[1] if win else None),
                 cycles=(cycles if cycles is not None else []),
@@ -267,7 +287,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             # sanity_plot_window_cycles may require i0/i1 ints; skip plot if incomplete
             if (df2 is not None) and (P_contact_N is not None) and (win is not None) and (cycles is not None):
                 figs = sanity_plot_window_cycles(
-                    df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N,
+                    df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N, depth=h_m if h_m is not None else np.zeros_like(t),
                     i0=win[0], i1=win[1], cycles=cycles, cal_sl=cal_sl_lat, title=fp.stem
                 )
         decision = approve_or_repick_gate(figs, "approve (a)/ repick touch (t) / repick window (w) / repick cycles (c) / pass (p) / abort (esc)")
@@ -275,16 +295,28 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     else:
         decision = "approve"  # no manual mode
         if live_plots:
-            figs = sanity_plot_window_cycles( df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N, 
+            figs = sanity_plot_window_cycles( df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N, depth=h_m if h_m is not None else np.zeros_like(t), 
                                       i0=win[0], i1=win[1], cycles=cycles, cal_sl=cal_sl_lat, title=fp.stem)
             figs = show_and_wait(f"{fp.stem} — auto analysis complete", figures=figs)
-
+    print(decision)
     if decision == "repick_touch":
         touch_i = manual_pick_touch(df2, cfg, initial=touch_i)
         # recompute spring fit + P_contact_N + h/A etc as needed
-        k_sup_z, b_sup_z, P_contact_N = _compute_normal_signals(touch_i)
+        k_sup_z, b_sup_z, P_contact_N, h_m = _compute_normal_signals(touch_i)
         # recompute cal dynamics + df2
         df2, cal_sl_lat, cal_sl_vert, k_sup_z_dyn, b_sup_z_dyn, cpl = _compute_df2(df, cfg, markers, scale, touch_i)
+        # RECOMPUTE
+        touch_meta.update(recompute_touch_meta_from_index(
+            t_s=t,
+            F_mN=Fz_raw_N * 1e3,
+            z_nm=z_raw_m * 1e9,
+            touch_i=touch_i,
+            daq_hz=getattr(cfg, "daq_hz", 500.0),
+            offset_seconds=getattr(cfg, "touch_offset_seconds", 2.0),
+            offset_margin_s=getattr(cfg, "touch_offset_margin_s", 0.5),
+            sigma_F_point_mN=getattr(cfg, "sigma_Fz_N", 10e-9) * 1e3,  # 10 nN -> 0.01 mN
+            sigma_z_point_nm=(getattr(cfg, "sigma_z_m", np.nan) * 1e9 if np.isfinite(getattr(cfg, "sigma_z_m", np.nan)) else None),
+        ))
         # recompute shear window + cycles
         try:
             i0, i1 = find_shear_window_from_normal_load_v2(t, P_contact_N, touch_i,cfg)
@@ -330,11 +362,13 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         actuator_mck_vertical = fit_actuator_mck(t[linear_slice], z_raw_m[linear_slice], Fz_raw_N[linear_slice])
         P_correct_mck =correct_contact_force(t, z_raw_m, Fz_raw_N, float(actuator_mck_vertical.get("m_eff", np.nan)),
                                             actuator_mck_vertical.get("c_eff", np.nan), actuator_mck_vertical.get("k_eff", np.nan))
+    except Exception as e:
+        actuator_mck_vertical = {"m_eff": np.nan, "c_eff": np.nan, "k_eff": np.nan, "error": str(e)}
+    try:
         actuator_mck_lateral = fit_actuator_mck(t[cal_sl_lat], df2["X2_pk_m"][cal_sl_lat], df2["F2_pk_N"][cal_sl_lat])
         F2_pk_cor_mck = correct_contact_force(t, df2["X2_pk_m"], df2["F2_pk_N"], float(actuator_mck_lateral.get("m_eff", np.nan)),
                                             actuator_mck_lateral.get("c_eff", np.nan), actuator_mck_lateral.get("k_eff", np.nan))
     except Exception as e:
-        actuator_mck_vertical = {"m_eff": np.nan, "c_eff": np.nan, "k_eff": np.nan, "error": str(e)}
         actuator_mck_lateral = {"m_eff": np.nan, "c_eff": np.nan, "k_eff": np.nan, "error": str(e)}
 
     # Attach normal/depth/area + metadata to df2 for downstream functions/plots
@@ -358,7 +392,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
 
     if live_plots and getattr(cfg, "final_approve_plot", False):
         figs = sanity_plot_window_cycles(
-            df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N,
+            df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N, depth=h_m if h_m is not None else np.zeros_like(t),
             i0=i0, i1=i1, cycles=cycles, cal_sl=cal_sl_lat, title=fp.stem
         )
         figs = show_and_wait(f"{fp.stem} — final indices", figs)
@@ -370,16 +404,29 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     if ref_i.size == 0:
         ref_i = np.array([i0], dtype=int)
 
-    Sz_initial = np.nan
+    Sz_ref = None
+    sigma_Sz_ref = None
     if Sz_arr is not None and ref_i.size:
-        Sz_initial = robust_median(Sz_arr[ref_i])
+        Sz_ref = float(robust_median(Sz_arr[ref_i])) if ref_i.size else float(Sz_arr[i0])
+        sigma_Sz_ref = float(robust_mad(Sz_arr[ref_i])) if ref_i.size else float(robust_mad(Sz_arr[max(0,i0-50):i0+50]))
+    elif Sz_arr is not None and i0 is not None:
+        Sz_ref = float(Sz_arr[i0]) if np.isfinite(Sz_arr[i0]) else np.nan
+        sigma_Sz_ref = float(robust_mad(Sz_arr[max(0, i0-50): i0+50])) if np.isfinite(Sz_arr[i0]) else np.nan
 
     h_ref = robust_median(h_m[ref_i]) if ref_i.size else np.nan
     A_ref_nom = robust_median(A_nominal[ref_i]) if ref_i.size else np.nan
-    E_ref_total = robust_median(df2["E_diss_fn_total_J"][ref_i]) if ref_i.size else np.nan
-    P_ref_total = robust_median(df2["P_diss_fn_W"][ref_i]) if ref_i.size else np.nan
-    X_ref_1st = robust_median(df2["X1st_pk"][ref_i]) if ref_i.size else np.nan
-    X_ref_2nd = robust_median(df2["X2nd_pk"][ref_i]) if ref_i.size else np.nan
+    
+    ## energy refs ~comparable with later cyclic
+    try:
+        X_ref_1st = robust_median(df2["X1st_pk"][ref_i]) if ref_i.size and df2["X1st_pk"].size else np.nan
+        X_ref_2nd = robust_median(df2["X2nd_pk"][ref_i]) if ref_i.size and df2["X2nd_pk"].size else np.nan
+        E_ref_total = robust_median(df2["E_diss_fn_total_J"][ref_i]) if ref_i.size and df2["E_diss_fn_total_J"].size else np.nan
+        P_ref_total = robust_median(df2["P_diss_fn_W"][ref_i]) if ref_i.size and df2["P_diss_fn_W"].size else np.nan
+    except:
+        E_ref_total=np.nan
+        P_ref_total=np.nan
+        X_ref_1st=np.nan
+        X_ref_2nd=np.nan
 
     if (not np.isfinite(A_ref_nom)) or (A_ref_nom <= 0):
         A_ref_nom = float(A_nominal[i0]) if np.isfinite(A_nominal[i0]) else np.nan
@@ -418,9 +465,8 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
 
     flat_fit = {"ok": 0}
     boot_flat = {"ok": 0}
-
     if (Sz_arr is not None) and _finite(E_star):
-        a_csm = a_from_Sz(Sz_arr, float(E_star))
+        a_csm = a_from_stiffness_Sneddon(Sz_arr, float(E_star))
         A_csm = A_from_a(a_csm)
 
         load_sl = slice(int(touch_i), int(i0) + 1)
@@ -441,72 +487,33 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             clip_sigma=float(getattr(cfg, "flat_clip_sigma", 3.0)),
             min_points=int(getattr(cfg, "flat_min_points", 30)),
         )
-
-        boot_flat = bootstrap_flat_end_stiffness_uncertainty(
-            P_contact_N[load_sl], Sz_arr[load_sl],
-            fit_fn=fit_flat_end_stiffness,
-            fit_kwargs=dict(
-                E_star_Pa=E_star,
-                P_min_N=getattr(cfg, "flat_Pmin_N", None),
-                P_max_N=getattr(cfg, "flat_Pmax_N", None),
-                robust=True,
-                n_iter=int(getattr(cfg, "flat_iter", 6)),
-                clip_sigma=float(getattr(cfg, "flat_clip_sigma", 3.0)),
-                min_points=int(getattr(cfg, "flat_min_points", 30)),
-            ),
-            n_boot=int(getattr(cfg, "flat_boot_n", 400)),
-            seed=int(getattr(cfg, "flat_boot_seed", 0)),
-            keep_frac=float(getattr(cfg, "flat_boot_keep_frac", 1.0)),
-            min_success=int(getattr(cfg, "flat_boot_min_success", 50)),
-            block_size=int(getattr(cfg, "flat_boot_block", 10)),
-        )
+    if (touch_i is not None) and (i0 is not None) and (int(i0) > int(touch_i) + 5):
+        load_sl = slice(int(touch_i), int(i0) + 1)
+        h_load = h_m[load_sl]
+        P_load = P_contact_N[load_sl]
+        hertz_kwargs = dict(
+        E_star_Pa=E_star,
+        adhesion_model=getattr(cfg, "adhesion_model", "auto"),
+        w_J_per_m2=getattr(cfg, "w_J_per_m2", 0.0),
+        sigma_rms_m=getattr(cfg, "sigma_rms_m", None),
+        rough_model=getattr(cfg, "rough_model", "none"),
+        delta0_m=getattr(cfg, "delta0_m", 0.3e-9),
+        z0_m=getattr(cfg, "z0_m", 0.3e-9),
+        mu_dmt=getattr(cfg, "mu_dmt", 0.1),
+        mu_jkr=getattr(cfg, "mu_jkr", 5.0),
+        min_h_m=getattr(cfg, "hertz_min_h_m", 0.0),
+        max_frac_of_Pmax=getattr(cfg, "hertz_max_frac_of_Pmax", 1.0),
+        min_points=int(getattr(cfg, "hertz_min_points", 8)),
+        n_iter=int(getattr(cfg, "hertz_iter", 6)),
+        R0_m=getattr(cfg, "tip_radius_m", None),
+    )
+        hertz = hertz_fit_radius_adhesion(h_load, P_load, **filter_kwargs_for_callable(hertz_fit_radius_adhesion, hertz_kwargs))
+    else:
+        hertz = {"ok": 0, "reason": "loading segment empty/too short"}
     boot_hertz = {"ok": 0}
-    if getattr(cfg, "hertz_enable", False):
-        if (touch_i is not None) and (i0 is not None) and (int(i0) > int(touch_i) + 5):
-            load_sl = slice(int(touch_i), int(i0) + 1)
-            h_load = h_m[load_sl]
-            P_load = P_contact_N[load_sl]
-
-            hertz_kwargs = dict(
-                E_star_Pa=E_star,
-                adhesion_model=getattr(cfg, "adhesion_model", "auto"),
-                w_J_per_m2=getattr(cfg, "w_J_per_m2", 0.0),
-                sigma_rms_m=getattr(cfg, "sigma_rms_m", None),
-                rough_model=getattr(cfg, "rough_model", "none"),
-                delta0_m=getattr(cfg, "delta0_m", 0.3e-9),
-                z0_m=getattr(cfg, "z0_m", 0.3e-9),
-                mu_dmt=getattr(cfg, "mu_dmt", 0.1),
-                mu_jkr=getattr(cfg, "mu_jkr", 5.0),
-                min_h_m=getattr(cfg, "hertz_min_h_m", 0.0),
-                max_frac_of_Pmax=getattr(cfg, "hertz_max_frac_of_Pmax", 1.0),
-                min_points=int(getattr(cfg, "hertz_min_points", 8)),
-                n_iter=int(getattr(cfg, "hertz_iter", 6)),
-                R0_m=getattr(cfg, "tip_radius_m", None),
-            )
-
-            # --- main fit ---
-            hertz = hertz_fit_radius_adhesion(h_load, P_load, **filter_kwargs_for_callable(hertz_fit_radius_adhesion, hertz_kwargs))
-
-            # --- bootstrap fit ---
-            boot_hertz = bootstrap_hertz_radius_uncertainty(
-                h_load, P_load,
-                fit_fn=hertz_fit_radius_adhesion,
-                fit_kwargs=filter_kwargs_for_callable(hertz_fit_radius_adhesion, hertz_kwargs),
-                # DO NOT pass Sz_meas unless hertz_fit actually uses it
-                # Sz_meas_N_per_m=(Sz_arr[load_sl] if Sz_arr is not None else None),
-                n_boot=int(getattr(cfg, "hertz_boot_n", 300)),
-                seed=int(getattr(cfg, "hertz_boot_seed", 0)),
-                keep_frac=float(getattr(cfg, "hertz_boot_keep_frac", 1.0)),
-                min_success=int(getattr(cfg, "hertz_boot_min_success", 30)),
-                block_size=int(getattr(cfg, "hertz_boot_block", 10)),
-            )
-        else:
-            hertz = {"ok": 0, "reason": "loading segment empty/too short"}
-
-
     # ---- Decide on reference area model (after Hertz diagnostic)
     area_mode_selected = getattr(cfg, "area_mode", "nominal")  # default from cfg; can be overridden by gate if live_plots
-    if live_plots: # and getattr(cfg, "area_pick_enable", False):
+    if live_plots and load_sl is not None: # and getattr(cfg, "area_pick_enable", False):
     # default comes from cfg.area_mode
         figs.append(plot_flat_end_fit(P_contact_N[load_sl], Sz_arr[load_sl], flat_fit, E_star_Pa=E_star) if flat_fit.get("ok", 0) else None)
         figs.extend(plot_hertz_diagnostic(
@@ -521,9 +528,45 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     
     ####Decide on reference area: which fit to be trusted:
     A_m2_used, area_mode_used = compute_area_from_choice(
-    h_m, P_contact_N, area_mode_selected, cfg=cfg, E_star_Pa=E_star, hertz=hertz, flat_end=flat_fit
-    )
+        h_m, P_contact_N, area_mode_selected,
+        cfg=cfg, E_star_Pa=E_star, hertz=hertz, flat_end=flat_fit,
+        Sz_meas_N_per_m=Sz_arr,   # NEW
+    )        
 
+    # --- bootstrap fit ---
+    if area_mode_used == "fit_hertz":        
+        boot_hertz = bootstrap_hertz_radius_uncertainty(
+            h_load, P_load,
+            fit_fn=hertz_fit_radius_adhesion,
+            fit_kwargs=filter_kwargs_for_callable(hertz_fit_radius_adhesion, hertz_kwargs),
+            # DO NOT pass Sz_meas unless hertz_fit actually uses it
+            # Sz_meas_N_per_m=(Sz_arr[load_sl] if Sz_arr is not None else None),
+            n_boot=int(getattr(cfg, "hertz_boot_n", 300)),
+            seed=int(getattr(cfg, "hertz_boot_seed", 0)),
+            keep_frac=float(getattr(cfg, "hertz_boot_keep_frac", 1.0)),
+            min_success=int(getattr(cfg, "hertz_boot_min_success", 30)),
+            block_size=int(getattr(cfg, "hertz_boot_block", 10)),
+        )
+    elif area_mode_used.startswith("flat"):
+        boot_flat = bootstrap_flat_end_stiffness_uncertainty(
+        P_contact_N[load_sl], Sz_arr[load_sl],
+        fit_fn=fit_flat_end_stiffness,
+        fit_kwargs=dict(
+            E_star_Pa=E_star,
+            P_min_N=getattr(cfg, "flat_Pmin_N", None),
+            P_max_N=getattr(cfg, "flat_Pmax_N", None),
+            robust=True,
+            n_iter=int(getattr(cfg, "flat_iter", 6)),
+            clip_sigma=float(getattr(cfg, "flat_clip_sigma", 3.0)),
+            min_points=int(getattr(cfg, "flat_min_points", 30)),
+        ),
+        n_boot=int(getattr(cfg, "flat_boot_n", 400)),
+        seed=int(getattr(cfg, "flat_boot_seed", 0)),
+        keep_frac=float(getattr(cfg, "flat_boot_keep_frac", 1.0)),
+        min_success=int(getattr(cfg, "flat_boot_min_success", 50)),
+        block_size=int(getattr(cfg, "flat_boot_block", 10)),
+    )
+        
     # pick reference area consistently from same ref window
     A_ref = robust_median(A_m2_used[ref_i]) if ref_i.size else np.nan
     if (not np.isfinite(A_ref)) or (A_ref <= 0):
@@ -541,32 +584,50 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     # analytic A uncertainty only for nominal geometry
     sigma_A_ref_nominal = None
     A_ref_nominal = None
+    sigma_k_frame = cfg.sigma_k_frame_z
+    sigma_R_m = cfg.sigma_tip_radius_m
+    # Prefer touch-derived channel noise/offsets if available
+    sigma_F_N = float(touch_meta.get("sigma_F_point_used_mN", 1e3 * cfg.sigma_Fz_N)) * 1e-3
+    sigma_z_m = float(touch_meta.get("sigma_z_point_used_nm", 1e9 * cfg.sigma_z_m)) * 1e-9
+
+    z0_m = 1e-9 * float(touch_meta.get("z0_nm", np.nan))
+    sigma_z0_m = 1e-9 * float(touch_meta.get("sigma_z0_nm", 0.0))
+
+    k_sup_z2, b_sup_z2, sigma_k_sup, sigma_b_sup, meta_vfit = fit_support_spring_pre_touch(z_raw_m, Fz_raw_N, touch_i, cfg)
+
+    sigma_P_N = sigma_P_contact(
+        Fz_raw_N, z_raw_m, k_sup_z2, b_sup_z2,
+        sigma_F_N=sigma_F_N,
+        sigma_z_m=sigma_z_m,
+        sigma_k_sup=sigma_k_sup,
+        sigma_b_sup=sigma_b_sup,
+        relative_to_touch=False,   # because P_contact_N comes from corrected_normal_load
+    )
+
+    sigma_h_m = sigma_h_contact(
+        z_raw_m, touch_i, P_contact_N, sigma_P_N,
+        k_frame_z=cfg.k_frame_z,
+        sigma_z_m=sigma_z_m,
+        sigma_k_frame_z= sigma_k_frame,
+        z0_m=z0_m,
+        sigma_z0_m=sigma_z0_m,
+    )
+
     if area_mode_used.lower().startswith("nominal"):
-        sigma_F_N = cfg.sigma_Fz_N
-        sigma_z_m = cfg.sigma_z_m
-        sigma_k_frame = cfg.sigma_k_frame_z
-        sigma_R_m = cfg.sigma_tip_radius_m
-
-        k_sup_z2, b_sup_z2, sigma_k_sup, sigma_b_sup = fit_support_spring_pre_touch(z_raw_m, Fz_raw_N, touch_i)
-
-        sigma_P_N = sigma_P_contact(
-            Fz_raw_N, z_raw_m, k_sup_z2, b_sup_z2,
-            sigma_F_N=sigma_F_N,
-            sigma_z_m=sigma_z_m,
-            sigma_k_sup=sigma_k_sup,
-            sigma_b_sup=sigma_b_sup,
-        )
-        sigma_h_m = sigma_h_contact(
-            z_raw_m, touch_i, P_contact_N, sigma_P_N,
-            k_frame_z=cfg.k_frame_z,
-            sigma_z_m=sigma_z_m,
-            sigma_k_frame_z=sigma_k_frame
-        )
         sigma_A_m2 = sigma_area_piRh(h_m, sigma_h_m, cfg.tip_radius_m, sigma_R_m)
         sigma_A_ref_nominal = float(robust_median(sigma_A_m2[ref_i])) if ref_i.size else float(sigma_A_m2[i0])
         A_ref_nominal = float(robust_median(A_nominal[ref_i])) if ref_i.size else float(A_nominal[i0])
 
     # sample A_ref in a way that matches the chosen area model
+    mode = (area_mode_used or "").lower()
+
+    # Defaults passed into build_Aref_samples
+    sigma_A_use = None
+
+    if mode.startswith("nominal_depth") or mode == "nominal":
+        # existing analytic depth-based sigma
+        sigma_A_use = sigma_A_ref_nominal
+
     A_ref_samples, diag = build_Aref_samples(
         area_mode_used=area_mode_used,
         A_ref=float(A_ref),
@@ -574,12 +635,15 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         P_ref=float(P_ref),
         E_star_Pa=float(E_star),
         cfg=cfg,
-        hertz = hertz,
-        boot_hertz = boot_hertz,
-        boot_flat = boot_flat,
-        sigma_A_ref = sigma_A_ref_nominal,
-        n_fallback = int(getattr(cfg, "ref_unc_n", 2000)),
-        seed = int(getattr(cfg, "ref_unc_seed", 0)),
+        hertz=hertz,
+        boot_hertz=boot_hertz,   # will often be None now
+        boot_flat=boot_flat,
+        sigma_A_ref=sigma_A_use,  # only for nominal_depth
+        n_fallback=int(getattr(cfg, "ref_unc_n", 2000)),
+        seed=int(getattr(cfg, "ref_unc_seed", 0)),
+        # NEW optional args:
+        Sz_ref=Sz_ref,
+        sigma_Sz_ref=sigma_Sz_ref,
     )
 
     A_stats = summarize_dist(A_ref_samples)
@@ -633,7 +697,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             df2, cfg, b, tr,
             h_ref=h_ref,
             A_ref=A_ref,
-            Sz_ref=Sz_initial,
+            Sz_ref=Sz_ref,
         )
         try:
             # ---- robust divide-by-zero / tiny-area guards ----
@@ -667,17 +731,36 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
                 # --- tau at stick->slip and re-stick, with CI from area uncertainty ---
                 Ft_ss_mN = row.get("Ft_ss_mN", np.nan)
                 Ft_rs_mN = row.get("Ft_rs_mN", np.nan)
+                sigma_Fss = row.get("sigma_Ft_ss_uN", 0) * 1e-3
+                sigma_Frs =  row.get("sigma_Ft_rs_uN", 0) * 1e-3
+                sigma_mu_ss = prop_div(Ft_ss_mN, sigma_Fss, load_max_mN, np.nanmedian(sigma_P_N[ref_i]))
+                sigma_mu_rs = prop_div(Ft_rs_mN, sigma_Frs, load_max_mN, np.nanmedian(sigma_P_N[ref_i]))
+                row["sigma_mu_ss"] = sigma_mu_ss
+                row["sigma_mu_rs"] = sigma_mu_rs
 
                 tau_ss = tau_from_samples(Ft_ss_mN, A_prev_samples, eps=EPS_A)
                 if tau_ss.size > 0:
                     st = summarize_dist(tau_ss)
-                    row["tau_ss_MPa"] = st["median"] / 1e6
-                    sigma_sym = ci95_to_sigma(st["median"], st["ci95"][0], st["ci95"][1])
-                    row["tau_ss_sigma_MPa"] = sigma_sym/1e6
-                    row["tau_ss_ci95_lo_MPa"] = st["ci95"][0] / 1e6
-                    row["tau_ss_ci95_hi_MPa"] = st["ci95"][1] / 1e6
+                    tau_med_Pa = st["median"]
+                    ci_lo_Pa, ci_hi_Pa = st["ci95"][0], st["ci95"][1]
+
+                    sigma_Pa, (ci_lo2_Pa, ci_hi2_Pa) = inflate_tau_uncertainty_with_force(
+                        tau_med_Pa=tau_med_Pa,
+                        ci95_lo_Pa=ci_lo_Pa,
+                        ci95_hi_Pa=ci_hi_Pa,
+                        Ft_mN=Ft_ss_mN,
+                        sigma_Ft_mN=sigma_Fss,
+                        ci95_to_sigma=ci95_to_sigma,
+                        sigma_to_ci95=sigma_to_ci95,
+                    )
+
+                    row["tau_ss_MPa"] = tau_med_Pa / 1e6
+                    row["tau_ss_sigma_MPa"] = sigma_Pa / 1e6
+                    row["tau_ss_ci95_lo_MPa"] = ci_lo2_Pa / 1e6
+                    row["tau_ss_ci95_hi_MPa"] = ci_hi2_Pa / 1e6
+
                 else:
-                    tau_nom, sigma_tau = tau_nominal_with_sigma(Ft_ss_mN,A_ref_nominal, sigma_A_m2=sigma_A_ref_nominal)
+                    tau_nom, sigma_tau = tau_nominal_with_sigma(Ft_ss_mN,A_ref_nominal, sigma_A_m2=sigma_A_ref_nominal, sigma_Ft_mN = sigma_Fss)
                     ci_lo, ci_hi = sigma_to_ci95(tau_nom, sigma_tau)
                     row["tau_ss_MPa"] = tau_nom
                     row["tau_ss_sigma_MPa"] = sigma_tau
@@ -687,14 +770,25 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
                 tau_rs = tau_from_samples(Ft_rs_mN, A_now_samples, eps=EPS_A)
                 if tau_rs.size > 0:
                     st = summarize_dist(tau_rs)
-                    row["tau_rs_MPa"] = st["median"] / 1e6
-                    sigma_sym = ci95_to_sigma(st["median"], st["ci95"][0], st["ci95"][1])
-                    row["tau_rs_sigma_MPa"] = sigma_sym/1e6
-                    row["tau_rs_ci95_lo_MPa"] = st["ci95"][0] / 1e6
-                    row["tau_rs_ci95_hi_MPa"] = st["ci95"][1] / 1e6
+                    tau_med_Pa = st["median"]
+                    ci_lo_Pa, ci_hi_Pa = st["ci95"][0], st["ci95"][1]
+
+                    sigma_Pa, (ci_lo2_Pa, ci_hi2_Pa) = inflate_tau_uncertainty_with_force(
+                        tau_med_Pa=tau_med_Pa,
+                        ci95_lo_Pa=ci_lo_Pa,
+                        ci95_hi_Pa=ci_hi_Pa,
+                        Ft_mN=Ft_rs_mN,
+                        sigma_Ft_mN=sigma_Frs,
+                        ci95_to_sigma=ci95_to_sigma,
+                        sigma_to_ci95=sigma_to_ci95,
+                    )
+                    row["tau_rs_MPa"] = tau_med_Pa / 1e6
+                    row["tau_rs_sigma_MPa"] = sigma_Pa / 1e6
+                    row["tau_rs_ci95_lo_MPa"] = ci_lo2_Pa / 1e6
+                    row["tau_rs_ci95_hi_MPa"] = ci_hi2_Pa / 1e6
                 else:
                     tau_nom, sigma_tau = tau_nominal_with_sigma(Ft_rs_mN,A_ref_nominal,
-                                                                 sigma_A_m2=sigma_A_ref_nominal)
+                                                                 sigma_A_m2=sigma_A_ref_nominal, sigma_Ft_mN = sigma_Frs)
                     ci_lo, ci_hi = sigma_to_ci95(tau_nom, sigma_tau)
                     row["tau_rs_MPa"] = tau_nom
                     row["tau_rs_sigma_MPa"] = sigma_tau
@@ -787,7 +881,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     )
 
     # ---- per-file constants copied into each cycle row
-    report["Sz_initial_N_per_m"] = float(Sz_initial) if np.isfinite(Sz_initial) else np.nan
+    report["Sz_ref_N_per_m"] = float(Sz_ref) if np.isfinite(Sz_ref) else np.nan
     report["initial_h_nm"] = float(h_ref * 1e9) if np.isfinite(h_ref) else np.nan
     report["A_ref_um2"] = float(A_ref * 1e12) if np.isfinite(A_ref) else np.nan
     report["area_mode_used"] = str(area_mode_used)
@@ -918,6 +1012,11 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     report["k_lat_N_per_m"] = float(actuator_mck_lateral.get("k_eff", np.nan)) if isinstance(actuator_mck_lateral, dict) else np.nan
     report["lat_mck_error"] = str(actuator_mck_lateral.get("error", "")) if isinstance(actuator_mck_lateral, dict) else ""
 
+    report["E_ref_tot"] = E_ref_total
+    report["P_ref_tot"] = P_ref_total
+    report["X_ref_1st"] = X_ref_1st
+    report["X_ref_2nd"] = X_ref_2nd
+
     # -----------------------------
     # 10) Summary dict (one row per file; use exact same scalars as report)
     # -----------------------------
@@ -929,11 +1028,13 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         "n_cycles": int(len(cycles)),
 
         # core reference quantities (match report)
-        "Sz_initial_N_per_m": float(Sz_initial) if np.isfinite(Sz_initial) else np.nan,
+        "Sz_ref_N_per_m": float(Sz_ref) if np.isfinite(Sz_ref) else np.nan,
         "initial_h_nm": float(h_ref * 1e9) if np.isfinite(h_ref) else np.nan,
+        "sigma_depth_nm": np.nanmedian(sigma_h_m[ref_i]) * 1e9 if sigma_h_m.size else np.nan,
         "A_ref_um2": float(A_ref * 1e12) if np.isfinite(A_ref) else np.nan,
         "area_mode_used": str(area_mode_used),
         "load_max_mN": float(load_max_mN) if np.isfinite(load_max_mN) else np.nan,
+        "sigma_load_mN": np.nanmedian(sigma_P_N[ref_i]) * 1e3 if sigma_P_N.size else np.nan,
         "pressure_ref_GPa": float(p_report_GPa) if np.isfinite(p_report_GPa) else np.nan,
         "pressure_ref_ci95_lo_GPa": float(pressure_ci95_lo_GPa) if np.isfinite(pressure_ci95_lo_GPa) else np.nan,
         "pressure_ref_ci95_hi_GPa": float(pressure_ci95_hi_GPa) if np.isfinite(pressure_ci95_hi_GPa) else np.nan,
@@ -942,7 +1043,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         "k_sup_z_N_per_m": float(k_sup_z),
         "b_sup_z_N": float(b_sup_z),
         "k_sup_x_N_per_m": float(df2["kx_sup_est_N_per_m"].iloc[0]) if "kx_sup_est_N_per_m" in df2.columns else np.nan,
-        "b_sup_x_N": float(df2["bx_sup_est_N"].iloc[0]) if "bx_sup_est_N" in df2.columns else np.nan,
+        "c_sup_x_Ns_per_m": float(df2["cx_sup_est_Ns_per_m"].iloc[0]) if "cx_sup_est_Ns_per_m" in df2.columns else np.nan,
         "markers_found": ";".join(sorted(markers.keys())) if markers else "",
         "cal_slice_start": int(cal_sl_lat.start) if cal_sl_lat is not None else -1,
         "cal_slice_end": int(cal_sl_lat.stop - 1) if cal_sl_lat is not None else -1,
@@ -977,6 +1078,8 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         "flat_end_a_flat_um" : float(flat_fit.get("a_flat_um", np.nan)) if isinstance(flat_fit, dict) else np.nan,
         "flat_end_boot_ok" : int(boot_flat.get("ok", 0)) if isinstance(boot_flat, dict) else 0,
         "flat_end_boot_n_success" : int(boot_flat.get("n_success", 0)) if isinstance(boot_flat, dict) else 0,
+        **touch_meta,
+        **meta_vfit,
         }
     # Save per-file long report
     if outdir is not None:
@@ -1041,7 +1144,7 @@ def analyze_batch(
 
         except Exception as e:
             tb = traceback.format_exc()
-
+            print(tb)
             # file-level failure summary
             summ_fail = {
                 "file": fp.name,
@@ -1144,17 +1247,28 @@ def analyze_batch(
     # (1) short summary (one row per file)
     summary_cols = [c for c in [
         "file", "ok", "error",
-        "initial_h_nm", "load_max_mN", "A_ref_um2", "pressure_ref_GPa",
-        "pressure_ref_ci95_lo_GPa", "pressure_ref_ci95_hi_GPa",
-        "area_mode_used",
-        "Sz_initial_N_per_m",
+        #spring calibrations
+        "k_sup_z_N_per_m", "b_sup_z_Ns_per_m", "k_sup_x_N_per_m", "b_sup_x_Ns_per_m",
+        # dynamics / coupling
+        "k_sup_z_dyn_N_per_m","b_sup_z_dyn_N", "kzx_dyn_N_per_m",
+        # touch index meta data output
+        "method", "dt_s","nmin","win","sigma_F_point_known_mN","daq_hz","F0_mN","F0_n_used","sigma_F_point_est_mN",
+        "sigma_F_point_used_mN","sigma_F0_mN","z0_nm","z0_n_used","sigma_z_point_est_nm","sigma_z_point_used_nm",
+        "sigma_z0_nm","F0_mN","sigma_F0_mN","z0_nm","sigma_z0_nm","touch_idx_mc_ok","touch_idx_ci95_lo",
+        "touch_idx_ci95_hi","touch_idx_sigma","sigma_F_point_used_mN","sigma_z_point_used_nm", "touch_mc_seed",
+        # initial-max- depth, load and area calculation
+        "initial_h_nm", "sigma_depth_nm", "load_max_mN", "sigma_load_mN", "area_mode_used",
+        "Sz_ref_N_per_m", "A_ref_um2", 
+        # pressure
+        "pressure_ref_GPa", "pressure_ref_ci95_lo_GPa", "pressure_ref_ci95_hi_GPa",
+        #area mode diagnostics..
         # Hertz
         "hertz_ok", "R_eff_um", "R_eff_std_um", "R_eff_ci95_lo_um", "R_eff_ci95_hi_um",
         "hertz_rmse_mN", "hertz_n_used",
         "adhesion_model", "w_eff_J_per_m2", "tabor_mu", "Fadh_N",
         # Flat-end (optional)
         "flat_end_boot_ok", "flat_end_a_flat_med_um", "flat_end_R_eff_med_um",
-        # Diagnostics
+        # Diagnostics by direct stiffness channel and measured-depth or applied-load
         "R_from_CSM_a_h_um", "R_from_CSM_a_P_um",
     ] if c in summaries_df.columns]
 

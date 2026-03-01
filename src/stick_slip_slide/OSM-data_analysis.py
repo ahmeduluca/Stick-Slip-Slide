@@ -730,8 +730,7 @@ def hertz_fit_radius_adhesion(
     The objective is:
         rmse_combined = rmse_P + stiff_wt * rmse_Sz
 
-    Choose stiff_wt ~ 0.0 for "check only", or ~0.05–0.2 if you want Sz to gently
-    regularize R in noisy P(h) data.
+    Choose stiff_wt ~ 0.0 for "check only"
     """
 
     # ---------------------------------------------------------------------
@@ -1039,7 +1038,6 @@ def total_sliding_cyc_dist_speed(
     amp : array
         Lateral displacement amplitude (same length as time_s).
         If amp_is_rms=True, amp is RMS and will be converted to peak.
-        Units should be meters if you want distance in meters and speeds in m/s.
     freq_Hz : float
         Oscillation frequency [Hz].
     start_i : int
@@ -1449,10 +1447,9 @@ def build_Aref_samples(
     - fit_hertz: sample R_eff from Hertz bootstrap CI/std, propagate A ~ pi*h*R for small indentation
                (Hertzian area_pi_h_R does this properly already).
     - flat_end: sample directly from flat bootstrap samples of a_flat_m (preferred),
-                or from R_eff_m samples if you want “Hertz-equivalent” path.
+                or from R_eff_m samples
 
     Important: We treat h_ref and P_ref as fixed scalars here.
-               You can extend later to sample h_ref too (but keep it stable first).
     """
     rng = np.random.default_rng(int(seed))
 
@@ -1678,8 +1675,6 @@ def sigma_h_contact(
     P0 = float(P[touch_i])
     sP0 = float(sP[touch_i])
 
-    # If you want more realistic z0 uncertainty, you can estimate it from a small
-    # pre-touch window. For now, sigma_z_m is the right baseline.
     sigma_z0 = float(sigma_z_m)
 
     if k_frame_z is None:
@@ -2289,7 +2284,7 @@ class Config:
     # model parameters
     sigma_tip_radius_m: float = 0.5e-6   # e.g. ±0.5 µm
     sigma_Estar_Pa: float = 2e9          # e.g. ±2 GPa
-    sigma_k_frame_z: float = 0.0         # if you want it; else 0
+    sigma_k_frame_z: float = 0.0       
 
     # lock-in lag model (for ramped envelopes)
     lockin_tau_s: float = 0.050
@@ -4968,7 +4963,7 @@ def analyze_one_file(fp: Path, cfg: Config, live_plots: bool, outdir: Optional[P
     df2["kzx_fit_N_per_m"] = float(cpl.get("kzx", np.nan))
     df2["Fz_coupling_r2"] = float(cpl.get("r2", np.nan))
 
-    # Optional: show final sanity plot (only if you still want it; otherwise remove to reduce blocking)
+    # Optional: show final sanity plot
     if live_plots and getattr(cfg, "final_approve_plot", False):
         figs = sanity_plot_window_cycles(
             df2=df2, cfg=cfg, t=t, P_contact_N=P_contact_N,
