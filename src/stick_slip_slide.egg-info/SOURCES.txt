@@ -18,6 +18,7 @@ src/stick_slip_slide/fitting.py
 src/stick_slip_slide/io.py
 src/stick_slip_slide/math_utils.py
 src/stick_slip_slide/mechanics.py
+src/stick_slip_slide/perssons.py
 src/stick_slip_slide/pipeline.py
 src/stick_slip_slide/plotting.py
 src/stick_slip_slide/reporting.py

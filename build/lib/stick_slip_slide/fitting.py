@@ -641,7 +641,7 @@ def fit_flat_end_stiffness(
     P_min_N: float | None = None,
     P_max_N: float | None = None,
     robust: bool = True,
-    n_iter: int = 6,
+    n_iter: int = 50,
     clip_sigma: float = 3.0,
     min_points: int = 30,
 ) -> dict:

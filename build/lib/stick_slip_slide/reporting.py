@@ -4,11 +4,15 @@ import pandas as pd
 from pathlib import Path
 from .config import Config
 from .math_utils import (robust_median, _num, keep_longest_contiguous, lockin_regime_stats)
-from .signal_processing import (window_idx_fw, harmonics_energy_regime_dict)
+from .signal_processing import (window_idx_fw, window_idx_bw, harmonics_energy_regime_dict, reconstruct_time_resolved_hysteresis)
 from .cycle_types import CycleBounds
 from .mechanics import (normal_pressure_Pa, shear_stress_Pa, estimate_lockin_lag_force_sigma,
-                          sigma_shear_strength, area_pi_h_R, a_from_stiffness_Sneddon)
+                          sigma_shear_strength, area_pi_h_R, a_from_stiffness_Sneddon, a_from_Sz,
+                          effective_modulus, effective_shear_modulus_byS_Pa, tau_scaled_byGrosslip,
+                          poisson, tau_by_inverseScaled_MPa, junction_growth_metric, 
+                          junction_growth_scale, fit_junction_growth_simple)
 from .fitting import mindlin_fit
+from .plotting import (plot_junc_growth,plot_reconstruction_diagnostics_ref, plot_loop_evolution, plot_regime_comparison_loops, show_and_wait)
 
 # ============================================================
 # Physics–statistics utilities (small, explicit, reusable)
@@ -321,22 +325,22 @@ def build_wide_summary_dynamic(all_cycles_df: pd.DataFrame, summaries_df: pd.Dat
 
     # which cycle-level columns to spread
     cycle_cols = [c for c in [
-        "Ft_ss_mN","mu_ss","sigma_mu_ss","tau_ss_MPa","tau_ss_ci95_lo_MPa","tau_ss_ci95_hi_MPa","tau_ss_sigma_MPa","X_ss_nm",
+        "contact_radius_init_nm", "contact_radius_end_nm","Ft_ss_mN","mu_ss","sigma_mu_ss","tau_ss_MPa",
+        "tau_ss_ci95_lo_MPa","tau_ss_ci95_hi_MPa","tau_ss_sigma_MPa","X_ss_nm",
         "Ft_rs_mN","mu_rs", "sigma_mu_rs","tau_rs_MPa","tau_rs_ci95_lo_MPa","tau_rs_ci95_hi_MPa","tau_rs_sigma_MPa","X_rs_nm",
-        "sigma_Ft_ss_uN","sigma_Ft_rs_uN",
-        "Sx_stuck_N_per_m","Sx_thresh_N_per_m",
-        "Sz_sliding","A_ratio_to_ref","K_ratio_to_ref",
-        "mindlin_a_N_per_m","mindlin_t_N","mindlin_rmse","mindlin_ok",
-        "mindlin_a_rd_N_per_m","mindlin_t_rd_N","mindlin_rmse_rd","mindlin_ok_rd",
+        "sigma_Ft_ss_uN","sigma_Ft_rs_uN", "tau_scaled_ss", "tau_scaled_rs", "tau_disp_ss_MPa", "tau_disp_rs_MPa",
+        "Sx_stuck_N_per_m","Sx_end_cyc","Shear_modulus_init_GPa","Shear_modulus_end_GPa","poisson_init", "poisson_end",
+        "Sx_thresh_N_per_m", "Sz_sliding", "Sz_init_cyc", "Sz_end_cyc","A_ratio_to_ref","K_ratio_to_ref", "Sz_turn", "Initial_junc_grw_slope",
+        "Initial_junc_grw_r2" "junction_growth_metric", "junction_growth_scale","mindlin_a_N_per_m","mindlin_t_N","mindlin_rmse",
+        "mindlin_ok", "mindlin_a_rd_N_per_m","mindlin_t_rd_N","mindlin_rmse_rd","mindlin_ok_rd", "hold_after_slid_s"
         "total_sliding_time_s", "total_osc_cycles", "total_slide_dist_m", "max_instantaneous_speed_m_per_s",
-        "mean_instantaneous_speed_m_per_s", "overall_mean_speed_m_per_s", "f0" "ru_cX_li_over_fft_med",
-        "ru_f0_est_med_Hz", "ru_Tw_s", "ru_E_li_tot_J", "ru_P_li_mean_W", "ru_E1_li_mean_J_per_cycle", "ru_E_harm_fft_cal_med_J_per_cycle",
-        "ru_E_nl_star_med_J_per_cycle", "ru_P_harm_fft_cal_mean_W", "ru_E_consistency_cal_minus_li_tot_J",
-        "ru_E_consistency_cal_minus_li_frac", "ru_X1st_fft_med_nm","ru_X2nd_fft_med_nm", "ru_X3rd_fft_med_nm",
-        "ru_THD_fft_med","ru_E_aug_fft_med_J_per_cycle",
-        "ru_dx_hyst_med_m", "ru_dx_hyst_rel_med","ru_f0_fft_med_Hz","ru_E_aug_fft_tot_J","ru_P_aug_fft_mean_W",
-        "hold_cX_li_over_fft_med",
-        "hold_f0_est_med_Hz", "hold_Tw_s", "hold_E_li_tot_J", "hold_P_li_mean_W", "hold_E1_li_mean_J_per_cycle", 
+        "mean_instantaneous_speed_m_per_s", "overall_mean_speed_m_per_s", 
+        "ru_cX_li_over_fft_med", "ru_f0_est_med_Hz", "ru_Tw_s", "ru_E_li_tot_J", "ru_P_li_mean_W", "ru_E1_li_mean_J_per_cycle",
+        "ru_E_harm_fft_cal_med_J_per_cycle", "ru_E_nl_star_med_J_per_cycle", "ru_P_harm_fft_cal_mean_W", 
+        "ru_E_consistency_cal_minus_li_tot_J", "ru_E_consistency_cal_minus_li_frac", "ru_X1st_fft_med_nm","ru_X2nd_fft_med_nm", 
+        "ru_X3rd_fft_med_nm", "ru_THD_fft_med","ru_E_aug_fft_med_J_per_cycle", "ru_dx_hyst_med_m", "ru_dx_hyst_rel_med",
+        "ru_f0_fft_med_Hz", "ru_E_aug_fft_tot_J","ru_P_aug_fft_mean_W",
+        "hold_cX_li_over_fft_med", "hold_f0_est_med_Hz", "hold_Tw_s", "hold_E_li_tot_J", "hold_P_li_mean_W", "hold_E1_li_mean_J_per_cycle", 
         "hold_E_harm_fft_cal_med_J_per_cycle", "hold_E_nl_star_med_J_per_cycle", "hold_P_harm_fft_cal_mean_W", 
         "hold_E_consistency_cal_minus_li_tot_J", "hold_E_consistency_cal_minus_li_frac", "hold_X1st_fft_med_nm",
         "hold_X2nd_fft_med_nm", "hold_X3rd_fft_med_nm", "hold_THD_fft_med","hold_E_aug_fft_med_J_per_cycle", 
@@ -360,6 +364,7 @@ def build_wide_summary_dynamic(all_cycles_df: pd.DataFrame, summaries_df: pd.Dat
         "initial_h_nm",
         "load_max_mN",
         "A_ref_um2",
+        "sigma_A_ref",
         "pressure_ref_GPa",
         "pressure_ref_ci95_lo_GPa",
         "pressure_ref_ci95_hi_GPa",
@@ -433,11 +438,14 @@ def summarize_cycle(
     h_ref: float,
     A_ref: float,
     Sz_ref: float,
+    outdir: str,
 ) -> Dict[str, float]:
     t = _num(df, cfg.time_col)
 
     hold = slice(b.i_hold0, b.i_hold1 + 1)  ##hold slice
-    between = window_idx_fw(t, b.i_end, cfg.post_window_s) ##post shear window must be set prior.
+    before = window_idx_fw(t, b.i_start, cfg.post_window_s) ##using same window for all for now.. should be in a few seconds anyway.
+    between = window_idx_fw(t, b.i_end, cfg.post_window_s) ##post shear window must be set prior.-"between" cons. cycles-
+    end = window_idx_bw(t, b.i_end, cfg.post_window_s) 
 
     P_contact_N = df["P_contact_N"].to_numpy()
     h_m = df["h_m"].to_numpy()
@@ -450,18 +458,25 @@ def summarize_cycle(
     Dx = df["Damping_lateral"].to_numpy()
     Xraw = df[cfg.x_raw_col].to_numpy()
 
-    A_ref_m2 = A_ref
+    A_ref_m2 = robust_median(A_m2[before]) if (A_m2 is not None and before.size > 0) else A_ref
     Sx_ref = 0.0 ##lateral stiffness at reference point-for stuck lateral stiffness before-after comparison
     
     ##Sz between cycles for reference junction growth calcs:
     ##Sz_cycle calculations to obtain A_hold; (Sz_cycle/Sz_ref)^2 = A_hold/A_ref
     Sz_end_of_cycle = robust_median(Sz[between]) if (Sz is not None and between.size > 0) else np.nan
+    Sz_initial = robust_median(Sz[before]) if (Sz is not None and before.size > 0) else Sz_ref
+    if Sz_initial is not np.nan and Sz_initial>0:
+        Sz_ref = Sz_initial
+    E_star = effective_modulus(cfg.E1_Pa, cfg.nu1, cfg.E2_Pa, cfg.nu2)
+    a_ref_nm = a_from_Sz(Sz_ref, E_star)*1e9
+    a_end_nm = a_from_Sz(Sz_end_of_cycle, E_star)*1e9
+    A_ref_m2 = A_ref_m2 if A_ref_m2 > 0. else 1e18*np.pi*a_ref_nm**2
 
     # Junction growth proxies
     K_ratio = (Sz_end_of_cycle / Sz_ref) if (np.isfinite(Sz_end_of_cycle) and np.isfinite(Sz_ref) and Sz_ref != 0) else np.nan
     A_ratio = (K_ratio**2) if np.isfinite(K_ratio) else np.nan
     A_cycle = (A_ratio * A_ref_m2) if (np.isfinite(A_ratio) and np.isfinite(A_ref_m2) and A_ref_m2 > 0) else np.nan
-
+    junc_g_met = junction_growth_metric(A_cycle, A_ref_m2)
 
     # --- transitions: may be missing for bad/noisy cycles
     i_ss = tr.get("i_ss", None)
@@ -472,6 +487,15 @@ def summarize_cycle(
     Ft_rs_N = tr.get("Ft_rs_N", np.nan)
     X_rs_m  = tr.get("X_rs_m", np.nan)
 
+    tau_over_G_ss = tau_scaled_byGrosslip(X_ss_m*1e9, a_ref_nm)
+    tau_over_G_rs = tau_scaled_byGrosslip(X_rs_m*1e9, a_end_nm)
+    
+    Sx_stuck = robust_median(Sx[before]) if (Sx is not None and before.size > 0) else tr.get("Sx_stuck", np.nan)
+    Sx_end_of_cycle = robust_median(Sx[end]) if (Sx is not None and end.size > 0) else tr.get("Sx_stuck", np.nan)
+    poisson_ss = poisson(Sx_stuck, Sz_ref)
+    poisson_rs = poisson(Sx_end_of_cycle, Sz_end_of_cycle)
+    G_eff_ss = effective_shear_modulus_byS_Pa(Sx_stuck, a_ref_nm)
+    G_eff_rs = effective_shear_modulus_byS_Pa(Sx_end_of_cycle, a_end_nm)
     # ensure indices are ints if finite
     if i_ss is not None:
         try:
@@ -535,10 +559,27 @@ def summarize_cycle(
     #     s_tau_rs = sigma_shear_strength(Ft_rs_N, A_rs, sigma_Ft_rs, sA_rs) / 1e6  # -> MPa
     # else:
     #     s_tau_rs = np.nan
-    
     # Mindlin fit windows
+    Sz_crit=0.
     if i_ss is not None: # and i_ss > b.i_peak:
         ru = slice(b.i_start, i_ss + 1) ##ramp-up slice
+        res={"slope": None, "intercept":None, "x":None, "y":None}
+        crit = window_idx_bw(t, i_ss, 0.5)
+        Sz_crit= robust_median(Sz[crit]) if (Sz is not None and crit.size > 0) else 0.
+        res = fit_junction_growth_simple(
+            Ft=Ft[ru],
+            Pz=P_contact_N[ru],
+            K=Sz[ru],
+            smooth_n=10,
+            n_ref=100,
+        )
+        try:
+            if(res.slope is not None):
+                plot_junc_growth(res)
+                jg=1
+        except:
+            jg=0
+            print("no junction growth")
     else:
         ru = slice(b.i_start, b.i_peak + 1) ##ramp-up slice (if no clear peak, just use picked srick to slide point as end of ramp-up)
     
@@ -627,6 +668,8 @@ def summarize_cycle(
     p_hold_GPa = (normal_pressure_Pa(np.array([P_hold]), np.array([A_hold]))[0] / 1e9) if (np.isfinite(A_hold) and A_hold > 0 and np.isfinite(P_hold)) else np.nan
     tau_hold_MPa = (shear_stress_Pa(np.array([Ft_hold]), np.array([A_hold]))[0] / 1e6) if (np.isfinite(A_hold) and A_hold > 0 and np.isfinite(Ft_hold)) else np.nan
 
+    # ref_slice = slice(before[0], before[-1] + 1)
+    # figs=[]
     harm_ru = harmonics_energy_regime_dict(
         t=t,
         x_raw=Xraw,
@@ -638,6 +681,24 @@ def summarize_cycle(
         prefix="ru",                 # avoids collisions
     )
     lia_stats_ru = lockin_regime_stats(sl = sel_slice, prefix="ru", F_pk=Ft, X_pk=Xc, phi=phi, Kp=Sx, Kpp=Dx)
+    # rec_ru = reconstruct_time_resolved_hysteresis(
+    #     t=df["Time"].to_numpy(),
+    #     x_raw_nm=Xraw,
+    #     Ft_rms_N= Ft,
+    #     sl=sel_slice,
+    #     f1_guess_hz= float(cfg.dyn_f2_freq_Hz),
+    #     transfer_phase_rad=0.,         # later put machine correction here
+    #     force_rms_to_peak= False,       #converted and corrected force amplitude used
+    #     reference_slice=ref_slice,
+    #     reference_phi1_rad=0
+    # )
+    # fig_ru, ax_ru = plot_reconstruction_diagnostics_ref(
+    #     rec_ru,
+    #     title_prefix="Ramp up",
+    # )
+    # figs.append(fig_ru)
+    # fig_1, ax_1 = plot_loop_evolution(rec_ru)
+    # figs.append(fig_1)
     harm_hold = harmonics_energy_regime_dict(
         t=t,
         x_raw=Xraw,
@@ -649,6 +710,23 @@ def summarize_cycle(
         prefix="hold",                 # avoids collisions
     )
     lia_stats_hold = lockin_regime_stats(sl = hold, prefix="hold", F_pk=Ft, X_pk=Xc, phi=phi, Kp=Sx, Kpp=Dx)
+    # rec_hold = reconstruct_time_resolved_hysteresis(
+    #     t=df["Time"].to_numpy(),
+    #     x_raw_nm=Xraw,
+    #     Ft_rms_N= Ft,
+    #     sl=hold,
+    #     f1_guess_hz= float(cfg.dyn_f2_freq_Hz),
+    #     transfer_phase_rad=0.,         # later put machine correction here
+    #     reference_slice=ref_slice,
+    #     force_rms_to_peak= False,       #converted and corrected force amplitude used
+    # )
+    # fig_hold, ax_hold = plot_reconstruction_diagnostics_ref(
+    #     rec_hold,
+    #     title_prefix="Hold",
+    # )
+    # figs.append(fig_hold)
+    # fig_2, ax_2 = plot_loop_evolution(rec_hold)
+    # figs.append(fig_2)
     harm_rd = harmonics_energy_regime_dict(
         t=t,
         x_raw=Xraw,
@@ -660,6 +738,34 @@ def summarize_cycle(
         prefix="rd",                 # avoids collisions
     )
     lia_stats_rd = lockin_regime_stats(sl = sel_slice_rd, prefix="rd", F_pk=Ft, X_pk=Xc, phi=phi, Kp=Sx, Kpp=Dx)
+    # rec_rd = reconstruct_time_resolved_hysteresis(
+    #     t=df["Time"].to_numpy(),
+    #     x_raw_nm=Xraw,
+    #     Ft_rms_N= Ft,
+    #     sl=sel_slice_rd,
+    #     f1_guess_hz= float(cfg.dyn_f2_freq_Hz),
+    #     transfer_phase_rad=0.,         # later put machine correction here
+    #     reference_slice=ref_slice,
+    #     force_rms_to_peak= False,       #converted and corrected force amplitude used
+    # )
+    # fig_rd, ax_rd = plot_reconstruction_diagnostics_ref(
+    #     rec_rd,
+    #     title_prefix="Ramp down",
+    # )
+    # figs.append(fig_rd)
+    # fig_3, ax_3 = plot_loop_evolution(rec_rd)
+    # figs.append(fig_3)
+    # fig, ax = plot_regime_comparison_loops(
+    #     rec_ru=rec_ru,
+    #     rec_sl=rec_hold,
+    #     rec_rd=rec_rd,
+    #     mode="rep",
+    #     title="Mean reconstructed loops by regime",
+    # )
+    # figs.append(fig)
+    # show_and_wait("Hysteresis", figs, outdir)
+
+    junc_g_scale = junction_growth_scale(Ft_ss_N*1e3, P_ss)
 
     return {
         "cycle": b.cycle,
@@ -667,6 +773,7 @@ def summarize_cycle(
         "t_hold0_s": float(t[b.i_hold0]),
         "t_hold1_s": float(t[b.i_hold1]),
         "t_end_s": float(t[b.i_end]),
+        "hold_after_slid_s": float(t[between[-1]]-t[between[0]]) if between.size is not None else 0.,
 
         # normal + geometry (hold)
         "P_hold_mN": float(P_hold * 1e3) if np.isfinite(P_hold) else np.nan,
@@ -695,16 +802,34 @@ def summarize_cycle(
         "X_rs_nm": float(X_rs_m * 1e9) if np.isfinite(X_rs_m) else np.nan,
         "mu_ss": float(mu_ss) if np.isfinite(mu_ss) else np.nan,
         "mu_rs": float(mu_rs) if np.isfinite(mu_rs) else np.nan,
+        "tau_scaled_ss": tau_over_G_ss,
+        "tau_scaled_rs": tau_over_G_rs,
+        "tau_disp_ss_MPa": tau_by_inverseScaled_MPa(tau_over_G_ss, G_eff_ss*1e-9),
+        "tau_disp_rs_MPa": tau_by_inverseScaled_MPa(tau_over_G_rs, G_eff_rs*1e-9),
 
-        "Sx_stuck_N_per_m": float(tr.get("Sx_stuck", np.nan)) if tr.get("Sx_stuck") is not None else np.nan,
+        "Sx_stuck_N_per_m": float(Sx_stuck) if Sx_stuck is not None else np.nan,
+        "Sx_end_cyc": float(Sx_end_of_cycle) if Sx_end_of_cycle is not None else np.nan,
+        "Shear_modulus_init_GPa": G_eff_ss*1e-9,
+        "Shear_modulus_end_GPa": G_eff_rs*1e-9,
         "Sx_thresh_N_per_m": float(tr.get("Sx_slide_used", np.nan)) if tr.get("Sx_slide_used") is not None else np.nan,
+        "poisson_init": poisson_ss,
+        "poisson_end": poisson_rs,
 
         "sigma_Ft_ss_uN" : float(sigma_Ft_ss * 1e6) if np.isfinite(sigma_Ft_ss) else np.nan,
         "sigma_Ft_rs_uN" : float(sigma_Ft_rs * 1e6) if np.isfinite(sigma_Ft_rs) else np.nan,
 
         # junction growth proxies
-        "A_ratio_to_ref": float((K_ratio**2)) if np.isfinite(K_ratio) else np.nan,
-        "K_ratio_to_ref": float(K_ratio) if np.isfinite(K_ratio) else np.nan,
+        "Sz_init_cyc": float(Sz_ref) if np.isfinite(Sz_ref) else np.nan,
+        "Sz_end_cyc": float(Sz_end_of_cycle) if np.isfinite(Sz_end_of_cycle) else np.nan,
+        "contact_radius_init_nm": a_ref_nm,
+        "contact_radius_end_nm": a_end_nm,
+        "A_ratio_to_ref": A_ratio,
+        "K_ratio_to_ref": K_ratio,
+        "Sz_turn" : Sz_crit,
+        "Initial_junc_grw_slope": res.slope if jg>0 else 0.,
+        "Initial_junc_grw_r2": res.r2_linear if jg>0 else 0.,
+        "junction_growth_metric": junc_g_met,
+        "junction_growth_scale": junc_g_scale,
         #"tau_ratio_to_ref": float(tau_ratio) if np.isfinite(tau_ratio) else np.nan,
 
         # mindlin ramp-up

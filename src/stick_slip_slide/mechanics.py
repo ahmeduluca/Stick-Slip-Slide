@@ -240,6 +240,7 @@ def compute_lateral_corrected(
     # ---- Support k,c from calibration, else fallback ----
     k_sup = np.nan
     c_sup = np.nan
+    cal={}
     cal_used = False
     cal_reason = ""
 
@@ -271,7 +272,7 @@ def compute_lateral_corrected(
             c_sup = 0.0
         else:
             c_sup = 0.0
-
+    print(cal)
     out["support_cal_used"] = cal_used
     out["support_cal_reason"] = cal_reason
     out["kx_sup_est_N_per_m"] = k_sup
@@ -326,6 +327,49 @@ def effective_modulus(E1: float, nu1: float, E2: float, nu2: float) -> float:
     """Hertz reduced modulus E* (Pa)."""
     inv = (1.0 - nu1**2) / E1 + (1.0 - nu2**2) / E2
     return 1.0 / inv if inv > 0 else np.nan
+
+def effective_shear_modulus_Pa(G1: float, nu1: float, G2: float, nu2: float) -> float:
+    """Reduced Shear Modulus"""
+    inv = (2.0-nu1)/ G1 + (2-nu2)/G2
+    return 1.0/inv if inv>0 else np.nan
+
+def effective_shear_modulus_byS_Pa(Sx: float, a: float) -> float:
+    """Reduced Shear Modulus by measured lateral stiffness and calculated contact radius."""
+    G = 1e9*Sx/(8.0*a) ## N/m divided by nm -> Pa.. or adjust for metric.
+    return G if np.isfinite(G) else np.nan 
+
+def poisson(Sx: float, Sz: float) -> float:
+    """ Poission's ratio by measured contact stiffness-Mindlin's approach """
+    ratio = Sx/Sz if Sz>0. else np.nan
+    return 2*((ratio-1)/(ratio-2)) if np.isfinite(ratio) else np.nan
+
+def tau_scaled(tau: float, G: float) -> float:
+    return tau/G if G>0. else np.nan
+
+def tau_scaled_byGrosslip(dx: float, a: float) -> float:
+    """ 
+    Using derived Mindlin solution by Y.Gao 2*X_critical / contact radius = scaled shear strength metric
+        careful on nm/nm  units.
+    """
+    return 2*dx/a if a>0. else np.nan
+
+def tau_by_inverseScaled_MPa(tau_scaled: float, G: float) -> float:
+    """
+    inverse calculation to check by displacement-amplitude shear strength value
+    -use shear modulus by one of the effective calculations.
+    conversion to MPa for direct check considering G is in GPa.
+    """
+    return tau_scaled*G*1e3
+
+def radius_scaled(a: float, b: float) -> float:
+    """ Scaling by burgers vector b"""
+    return a/b if b>0. else np.nan
+
+def junction_growth_metric(A: float, A0: float) -> float:
+    return (A/A0)**2-1 if A0>0. else np.nan
+
+def junction_growth_scale(Load: float, Friction: float)-> float:
+    return (Friction/Load)**2 if Load>0. else np.nan
 
 def hertz_fit_radius(h_m: np.ndarray, P_N: np.ndarray, E_star_Pa: float, hardness_Pa: float,
                      plasticity_p0_frac: float = 1.0, min_h_m: float = 5e-9,
@@ -589,11 +633,8 @@ def _auto_model_from_mu(mu: float, mu_dmt: float = 0.1, mu_jkr: float = 5.0) -> 
         return "jkr"
     return "transition"
 
-def a_from_Sz(Sz_N_per_m, E_star_Pa):
-    Sz = np.asarray(Sz_N_per_m, float)
-    if not (np.isfinite(E_star_Pa) and E_star_Pa > 0):
-        return np.full_like(Sz, np.nan)
-    return Sz / (2.0 * E_star_Pa)
+def a_from_Sz(Sz_N_per_m: float, E_star_Pa: float)-> float:
+    return Sz_N_per_m / (2.0 * E_star_Pa) if E_star_Pa>0. else np.nan
 
 def A_from_a(a_m):
     a = np.asarray(a_m, float)
@@ -1115,3 +1156,58 @@ def compute_area_from_choice(
         return A, "nominal_fallback"
 
     return _nominal_depth()
+
+def fit_junction_growth_simple(
+    Ft,
+    Pz,
+    K,
+    smooth_n=5,
+    n_ref=5,
+):
+    """
+    Very simple junction growth fit:
+
+        y = (K/K0)^4 - 1
+        x = (Ft/Pz)^2
+
+    Returns:
+        {"slope", "intercept", "x", "y"}
+    """
+
+    Ft = np.asarray(Ft, float)
+    Pz = np.asarray(Pz, float)
+    K  = np.asarray(K, float)
+
+    # first remove obviously bad raw points
+    m0 = np.isfinite(Ft) & np.isfinite(Pz) & np.isfinite(K) & (Pz != 0)
+
+    Ft = Ft[m0]
+    Pz = Pz[m0]
+    K  = K[m0]
+    if Ft.size < 2:
+        return {"slope": np.nan, "intercept": np.nan, "x": np.array([]), "y": np.array([])}
+
+    # --- build x and y ---
+    x = (Ft / Pz)**2
+
+    K0 = np.median(K[:n_ref]) if n_ref > 1 else K[0]
+    if (not np.isfinite(K0)) or (K0 == 0):
+        return {"slope": np.nan, "intercept": np.nan, "x": x, "y": np.array([])}
+
+    y = (K / K0)**4 - 1.0
+
+    # smoothing
+    if smooth_n > 1:
+        kernel = np.ones(smooth_n, dtype=float) / smooth_n
+        y = np.convolve(y, kernel, mode="same")
+
+    # final cleanup
+    m = np.isfinite(x) & np.isfinite(y)
+    x = x[m]
+    y = y[m]
+
+    if x.size < 2:
+        return {"slope": np.nan, "intercept": np.nan, "x": x, "y": y}
+
+    slope, intercept = np.polyfit(x, y, 1)
+    return {"slope": slope, "intercept": intercept, "x": x, "y": y}

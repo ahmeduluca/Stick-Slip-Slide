@@ -975,173 +975,427 @@ def manual_pick_cycles(df2: pd.DataFrame, cfg: Config, i0: int, i1: int, initial
         cycles.append(cb)
     return cycles
 
-# ============================================================
-# Transition detection: stick->slide and re-stick
-# ============================================================
 def detect_stick_slide_transitions(
     df: pd.DataFrame,
     b: CycleBounds,
-    sliding_lateral_stiffness_thresh: float,    # user threshold for stick->slide (Sx drops below)
-    resticking_lateral_stiffness_thresh: float, # user threshold for re-stick (Sx rises above)
-    frac_up: float,                             # fallback fraction for stick->slide: S_slide = frac_up * Sx_stuck
-    frac_low: float,                            # fallback fraction for re-stick:  S_re   = frac_low * Sx_stuck
-    low_frac_band: tuple[float, float],         # band of Ft/Ftmax to estimate Sx_stuck
+    sliding_lateral_stiffness_thresh: float,
+    resticking_lateral_stiffness_thresh: float,
+    frac_up: float,
+    frac_low: float,
+    low_frac_band: tuple[float, float],
     smooth_n: int,
+    cfg=None,
 ) -> dict:
     """
-    stick->slide (ramp-up): first index where Sx falls below S_slide
-    re-stick    (ramp-down): after hold ends, first index where Sx rises above S_re,
-                             but ONLY after it has gone below S_slide at least once.
+    Detect stick->slide (i_ss) and re-stick (i_rs) transitions.
 
-    Sx_stuck estimated as median Sx in early ramp-up band: Ft in [low*Ftmax, high*Ftmax].
+    Strategy
+    --------
+    Always compute BOTH:
+      1) stiffness-based transition
+      2) phase-based transition
+
+    Then select final i_ss / i_rs using cfg.trans_mode:
+      - "stiffness"
+      - "phase"
+
+    Main simplification
+    -------------------
+    Both stiffness and phase come from the same lock-in-derived signals,
+    so both methods use the SAME common branch-valid windows.
+
+    Common window idea
+    ------------------
+    Ramp-up:
+      - ignore the very beginning (initial settling / transient region)
+      - require meaningful lateral dynamic force amplitude
+
+    Ramp-down:
+      - ignore the very end (terminal transient / edge spike)
+      - require meaningful lateral dynamic force amplitude
+
+    Phase mode
+    ----------
+    Pick the most meaningful PHASE PEAK in each valid branch:
+      - ramp-up  -> first meaningful turnover peak (local max followed by a drop)
+      - ramp-down -> last meaningful turnover peak (local max followed by a drop)
+
+    Stiffness mode
+    --------------
+    Estimate an early-ramp Sx_stuck only within the valid ramp-up window,
+    then detect threshold crossings as before.
     """
-    Ft = df["F2_pk_corr_N"].to_numpy()
-    Xc = df["X2_pk_contact_m"].to_numpy()
-    Sx = df["Stiffness_lateral"].to_numpy()
 
-    # ---- ramp-up slice ----
+    # ------------------------------------------------------------------
+    # 0) Small local helpers
+    # ------------------------------------------------------------------
+    def _safe_nanmax(x):
+        x = np.asarray(x, float)
+        return np.nanmax(x) if np.isfinite(x).any() else np.nan
+
+    def _roll_med(x, n):
+        n = max(1, int(n))
+        return pd.Series(np.asarray(x, float)).rolling(n, center=True, min_periods=1).median().to_numpy()
+
+    def _local_maxima(y):
+        """
+        Return simple local maxima indices.
+        """
+        y = np.asarray(y, float)
+        if y.size < 3:
+            return np.asarray([], dtype=int)
+
+        out = []
+        for i in range(1, len(y) - 1):
+            if not (np.isfinite(y[i - 1]) and np.isfinite(y[i]) and np.isfinite(y[i + 1])):
+                continue
+            if (y[i] >= y[i - 1]) and (y[i] >= y[i + 1]) and ((y[i] > y[i - 1]) or (y[i] > y[i + 1])):
+                out.append(i)
+        return np.asarray(out, dtype=int)
+
+    def _select_peak_from_valid_branch(
+        y,
+        *,
+        prefer="early",
+        near_max_frac=0.98,
+        boundary_guard_frac=0.03,
+    ):
+        """
+        Pick the phase peak from a valid, already-masked branch trace.
+
+        Main rule:
+        - Work directly on the valid smoothed trace.
+        - Find the branch maximum.
+        - Keep points near that maximum.
+        - For ramp-up choose the earliest near-max point.
+        - For ramp-down choose the latest near-max point.
+
+        Why this is robust:
+        - does not depend on local-max detection
+        - works with broad peaks, one-point peaks, masked traces, and small plateaus
+        - sensitivity is controlled mainly by smoothing and near_max_frac
+
+        boundary_guard_frac:
+        - if the selected point lands too close to the start/end of the valid segment,
+        fall back to the exact argmax. This avoids strange edge picks.
+        """
+        y = np.asarray(y, float)
+        finite_idx = np.where(np.isfinite(y))[0]
+        if finite_idx.size == 0:
+            return None
+
+        vals = y[finite_idx]
+        j_argmax = int(finite_idx[np.nanargmax(vals)])
+        vmax = float(y[j_argmax])
+
+        # Keep only points near the branch maximum
+        near = vals >= float(near_max_frac) * vmax
+        idx_near = finite_idx[near]
+
+        if idx_near.size == 0:
+            return j_argmax
+
+        j = int(idx_near[0] if prefer == "early" else idx_near[-1])
+
+        # Optional boundary guard: if chosen point is too close to the valid-window edge,
+        # use the exact maximum instead.
+        lo = int(finite_idx[0])
+        hi = int(finite_idx[-1])
+        n_valid = max(1, hi - lo + 1)
+        g = max(1, int(round(float(boundary_guard_frac) * n_valid)))
+
+        if (j <= lo + g) or (j >= hi - g):
+            return j_argmax
+
+        return j
+    # ------------------------------------------------------------------
+    # 1) Read required channels
+    # ------------------------------------------------------------------
+    Ft = df["F2_pk_corr_N"].to_numpy(dtype=float)
+    Xc = df["X2_pk_contact_m"].to_numpy(dtype=float)
+    Sx = df["Stiffness_lateral"].to_numpy(dtype=float)
+    phi = df["phi2_rad"].to_numpy(dtype=float)
+
+    if bool(getattr(cfg, "phase_use_unwrap", False)):
+        m = np.isfinite(phi)
+        if np.any(m):
+            phi2 = phi.copy()
+            phi2[m] = np.unwrap(phi2[m])
+            phi = phi2
+
+    # ------------------------------------------------------------------
+    # 2) Define branch slices
+    # ------------------------------------------------------------------
     ru0 = int(b.i_start)
     ru1 = int(b.i_peak)
     ru = slice(ru0, ru1 + 1)
 
-    # ---- ramp-down slice: START AFTER HOLD ----
-    # This is the key fix: do not allow re-stick detection during peak/hold region.
     rd0 = int(max(b.i_hold1, b.i_peak))
     rd1 = int(b.i_end)
     rd = slice(rd0, rd1 + 1)
 
-    # Smooth Sx within each slice
-    Sx_ru_s = pd.Series(Sx[ru]).rolling(smooth_n, center=True, min_periods=1).median().to_numpy()
-    Sx_rd_s = pd.Series(Sx[rd]).rolling(smooth_n, center=True, min_periods=1).median().to_numpy()
-
+    # ------------------------------------------------------------------
+    # 3) Branch-wise arrays
+    # ------------------------------------------------------------------
     Ft_ru = Ft[ru]
+    Ft_rd = Ft[rd]
 
-    Ftmax = safe_nanmax(Ft_ru) if np.isfinite(Ft_ru).any() else np.nan
+    Sx_ru = Sx[ru]
+    Sx_rd = Sx[rd]
+
+    phi_ru = phi[ru]
+    phi_rd = phi[rd]
+
+    # ------------------------------------------------------------------
+    # 4) Smoothing
+    # ------------------------------------------------------------------
+    Sx_ru_s = _roll_med(Sx_ru, smooth_n)
+    Sx_rd_s = _roll_med(Sx_rd, smooth_n)
+
+    phase_smooth_n = int(getattr(cfg, "trans_smooth_n", smooth_n))
+    phi_ru_s = _roll_med(phi_ru, phase_smooth_n)
+    phi_rd_s = _roll_med(phi_rd, phase_smooth_n)
+
+    # ------------------------------------------------------------------
+    # 5) Basic validity
+    # ------------------------------------------------------------------
+    Ftmax = _safe_nanmax(Ft_ru)
     if not (np.isfinite(Ftmax) and Ftmax > 0):
         return {
             "i_ss": None, "i_rs": None,
-            "Sx_stuck": None,
-            "Sx_slide_used": None,
-            "Sx_restick_used": None,
-            "Ft_ss_N": None, "X_ss_m": None,
-            "Ft_rs_N": None, "X_rs_m": None,
-            "rd0": rd0,
+            "i_ss_stiff": None, "i_rs_stiff": None,
+            "i_ss_phase": None, "i_rs_phase": None,
+            "Ft_ss_N": np.nan, "Ft_rs_N": np.nan,
+            "X_ss_m": np.nan, "X_rs_m": np.nan,
+            "Ft_ss_stiff_N": np.nan, "Ft_rs_stiff_N": np.nan,
+            "Ft_ss_phase_N": np.nan, "Ft_rs_phase_N": np.nan,
+            "X_ss_stiff_m": np.nan, "X_rs_stiff_m": np.nan,
+            "X_ss_phase_m": np.nan, "X_rs_phase_m": np.nan,
+            "Sx_stuck": np.nan,
+            "Sx_slide_used": np.nan,
+            "Sx_restick_used": np.nan,
+            "Sx_slide_source": "none",
+            "Sx_restick_source": "none",
+            "phi_ss_peak_rad": np.nan,
+            "phi_rs_peak_rad": np.nan,
+            "trans_mode_used": str(getattr(cfg, "trans_mode", "stiffness")).strip().lower(),
             "went_low_first": 0,
+            "rd0": int(rd0),
         }
 
-    # ---- estimate Sx_stuck from early ramp-up ----
-    lo = low_frac_band[0] * Ftmax
-    hi = low_frac_band[1] * Ftmax
-    m_stuck = np.isfinite(Ft_ru) & np.isfinite(Sx_ru_s) & (Ft_ru >= lo) & (Ft_ru <= hi)
+    # ------------------------------------------------------------------
+    # 6) Common valid windows for BOTH stiffness and phase
+    # ------------------------------------------------------------------
+    # Start/end skips handle obvious lock-in transients
+    trans_skip_start_frac_up = float(getattr(cfg, "trans_skip_start_frac_up", 0.045))
+    trans_skip_end_frac_dn   = float(getattr(cfg, "trans_skip_end_frac_dn",   0.045))
+
+    # Meaningful-signal gate: dynamic lateral force must be above threshold
+    trans_min_valid_Ft_frac = float(getattr(cfg, "trans_min_valid_Ft_frac", 0.03))
+    Ft_cut = trans_min_valid_Ft_frac * Ftmax
+
+    nru = len(Ft_ru)
+    nrd = len(Ft_rd)
+
+    i_ru_start = max(0, int(round(trans_skip_start_frac_up * nru)))
+    i_ru_end   = nru
+
+    i_rd_start = 0
+    i_rd_end   = max(1, int(round((1.0 - trans_skip_end_frac_dn) * nrd)))
+
+    idx_ru = np.arange(nru)
+    idx_rd = np.arange(nrd)
+
+    m_ru_valid = np.isfinite(Ft_ru) & (Ft_ru >= Ft_cut) & (idx_ru >= i_ru_start) & (idx_ru < i_ru_end)
+    m_rd_valid = np.isfinite(Ft_rd) & (Ft_rd >= Ft_cut) & (idx_rd >= i_rd_start) & (idx_rd < i_rd_end)
+
+    # If too aggressive, relax force gate but keep skip windows
+    if m_ru_valid.sum() < 5:
+        m_ru_valid = np.isfinite(Ft_ru) & (idx_ru >= i_ru_start) & (idx_ru < i_ru_end)
+    if m_rd_valid.sum() < 5:
+        m_rd_valid = np.isfinite(Ft_rd) & (idx_rd >= i_rd_start) & (idx_rd < i_rd_end)
+
+    # ------------------------------------------------------------------
+    # 7) STIFFNESS-BASED TRANSITIONS
+    # ------------------------------------------------------------------
+    # Estimate Sx_stuck only within the common valid ramp-up window
+    stuck_band = getattr(cfg, "trans_stuck_band", low_frac_band)
+    lo = float(stuck_band[0]) * Ftmax
+    hi = float(stuck_band[1]) * Ftmax
+
+    m_stuck = (
+        np.isfinite(Sx_ru_s) &
+        m_ru_valid &
+        (Ft_ru >= lo) &
+        (Ft_ru <= hi)
+    )
 
     if m_stuck.sum() < 10:
-        idxs = np.where(np.isfinite(Sx_ru_s))[0][:max(10, min(30, len(Sx_ru_s)))]
-        Sx_stuck = float(np.nanmedian(Sx_ru_s[idxs])) if idxs.size else None
+        idxs = np.where(np.isfinite(Sx_ru_s) & m_ru_valid)[0][:max(10, min(30, len(Sx_ru_s)))]
+        Sx_stuck = float(np.nanmedian(Sx_ru_s[idxs])) if idxs.size else np.nan
     else:
         Sx_stuck = float(np.nanmedian(Sx_ru_s[m_stuck]))
 
-    if not (np.isfinite(Sx_stuck) and Sx_stuck > 0):
-        return {
-            "i_ss": None, "i_rs": None,
-            "Sx_stuck": Sx_stuck,
-            "Sx_slide_used": None,
-            "Sx_restick_used": None,
-            "Ft_ss_N": None, "X_ss_m": None,
-            "Ft_rs_N": None, "X_rs_m": None,
-            "rd0": rd0,
-            "went_low_first": 0,
-        }
+    i_ss_stiff = None
+    i_rs_stiff = None
+    Sx_slide = np.nan
+    Sx_re = np.nan
+    slide_source = "none"
+    re_source = "none"
+    went_low = False
 
-    # ---- decide thresholds: user-provided takes priority if finite ----
-    # stick->slide threshold (must be BELOW stuck)
-    Sx_slide = float(sliding_lateral_stiffness_thresh)
-    if not (np.isfinite(Sx_slide) and (Sx_slide < Sx_stuck)):
-        Sx_slide = float(frac_up) * Sx_stuck
-        slide_source = "frac"
-    else:
-        slide_source = "user"
-
-    # ---- stick->slide: first crossing below Sx_slide on ramp-up ----
-    i_ss_rel = None
-    for i, val in enumerate(Sx_ru_s):
-        if np.isfinite(val) and (val < Sx_slide):
-            i_ss_rel = i
+    if np.isfinite(Sx_stuck) and (Sx_stuck > 0):
+        # Stick->slide threshold
+        Sx_slide = float(sliding_lateral_stiffness_thresh)
+        if not (np.isfinite(Sx_slide) and (Sx_slide < Sx_stuck)):
+            Sx_slide = float(frac_up) * Sx_stuck
+            slide_source = "frac"
+        else:
             slide_source = "user"
-            break
-    if i_ss_rel is None:
-        # fallback: fraction of Sx_stuck
-        Sx_slide = float(frac_up) * Sx_stuck
+
+        # First crossing below threshold on valid ramp-up window only
         for i, val in enumerate(Sx_ru_s):
+            if not m_ru_valid[i]:
+                continue
             if np.isfinite(val) and (val < Sx_slide):
-                i_ss_rel = i
-                slide_source = "frac"
+                i_ss_stiff = ru0 + i
                 break
 
-    i_ss = (ru0 + i_ss_rel) if i_ss_rel is not None else None
+        if i_ss_stiff is None:
+            Sx_slide = float(frac_up) * Sx_stuck
+            slide_source = "frac"
+            for i, val in enumerate(Sx_ru_s):
+                if not m_ru_valid[i]:
+                    continue
+                if np.isfinite(val) and (val < Sx_slide):
+                    i_ss_stiff = ru0 + i
+                    break
 
-    # ---- re-stick: AFTER HOLD, require it went low first, then crosses above Sx_re ----
-    went_low = False
-    i_rs_rel = None
-    re_source = "none"
-    Sx_re = float(resticking_lateral_stiffness_thresh)
-    for j, val in enumerate(Sx_rd_s):
-        if not np.isfinite(val):
-            continue
-        # Step 1: detect "went low" (i.e., definitely in sliding regime)
-        if not went_low:
-            if val < Sx_slide:
-                went_low = True
-            continue
-        # Step 2: first time it rises above re-stick threshold
-        if val > Sx_re:
-            i_rs_rel = j
-            re_source = "user"
-            break
-    
-    if i_rs_rel is None:
-        Sx_re = float(frac_low) * Sx_stuck
-        went_low = False
-        # fallback: fraction of Sx_stuck
+        # Re-stick on valid ramp-down window only
+        Sx_re = float(resticking_lateral_stiffness_thresh)
+        if not np.isfinite(Sx_re):
+            Sx_re = np.nan
+
         for j, val in enumerate(Sx_rd_s):
+            if not m_rd_valid[j]:
+                continue
             if not np.isfinite(val):
                 continue
-        # Step 1: detect "went low" (i.e., definitely in sliding regime)
             if not went_low:
-                if val < Sx_slide:
+                if np.isfinite(Sx_slide) and (val < Sx_slide):
                     went_low = True
                 continue
-        # Step 2: first time it rises above re-stick threshold
-            if val > Sx_re:
-                i_rs_rel = j
-                re_source = "frac"
+            if np.isfinite(Sx_re) and (val > Sx_re):
+                i_rs_stiff = rd0 + j
+                re_source = "user"
                 break
-    i_rs = (rd0 + i_rs_rel) if i_rs_rel is not None else None
 
+        if i_rs_stiff is None:
+            Sx_re = float(frac_low) * Sx_stuck
+            re_source = "frac"
+            went_low = False
+            for j, val in enumerate(Sx_rd_s):
+                if not m_rd_valid[j]:
+                    continue
+                if not np.isfinite(val):
+                    continue
+                if not went_low:
+                    if np.isfinite(Sx_slide) and (val < Sx_slide):
+                        went_low = True
+                    continue
+                if val > Sx_re:
+                    i_rs_stiff = rd0 + j
+                    break
+
+   # ------------------------------------------------------------------
+    # 8) PHASE-BASED TRANSITIONS
+    # ------------------------------------------------------------------
+    phase_near_max_frac = float(getattr(cfg, "phase_near_max_frac", 0.98))
+    phase_boundary_guard_frac = float(getattr(cfg, "phase_boundary_guard_frac", 0.03))
+
+    phi_ru_work = np.where(m_ru_valid & np.isfinite(phi_ru_s), phi_ru_s, np.nan)
+    phi_rd_work = np.where(m_rd_valid & np.isfinite(phi_rd_s), phi_rd_s, np.nan)
+
+    i_ss_rel_phase = _select_peak_from_valid_branch(
+        phi_ru_work,
+        prefer="early",
+        near_max_frac=phase_near_max_frac,
+        boundary_guard_frac=phase_boundary_guard_frac,
+    )
+    i_rs_rel_phase = _select_peak_from_valid_branch(
+        phi_rd_work,
+        prefer="late",
+        near_max_frac=phase_near_max_frac,
+        boundary_guard_frac=phase_boundary_guard_frac,
+    )
+
+    i_ss_phase = (ru0 + i_ss_rel_phase) if i_ss_rel_phase is not None else None
+    i_rs_phase = (rd0 + i_rs_rel_phase) if i_rs_rel_phase is not None else None
+    # ------------------------------------------------------------------
+    # 9) Assemble outputs
+    # ------------------------------------------------------------------
     out = {
-        "i_ss": i_ss,
-        "i_rs": i_rs,
-        "Sx_stuck": float(Sx_stuck),
-        "Sx_slide_used": float(Sx_slide),
-        "Sx_restick_used": float(Sx_re),
+        # final selected outputs
+        "i_ss": None,
+        "i_rs": None,
+        "Ft_ss_N": np.nan,
+        "Ft_rs_N": np.nan,
+        "X_ss_m": np.nan,
+        "X_rs_m": np.nan,
+
+        # stiffness outputs
+        "i_ss_stiff": i_ss_stiff,
+        "i_rs_stiff": i_rs_stiff,
+        "Ft_ss_stiff_N": float(Ft[i_ss_stiff]) if i_ss_stiff is not None else np.nan,
+        "Ft_rs_stiff_N": float(Ft[i_rs_stiff]) if i_rs_stiff is not None else np.nan,
+        "X_ss_stiff_m": float(Xc[i_ss_stiff]) if i_ss_stiff is not None else np.nan,
+        "X_rs_stiff_m": float(Xc[i_rs_stiff]) if i_rs_stiff is not None else np.nan,
+        "Sx_stuck": float(Sx_stuck) if np.isfinite(Sx_stuck) else np.nan,
+        "Sx_slide_used": float(Sx_slide) if np.isfinite(Sx_slide) else np.nan,
+        "Sx_restick_used": float(Sx_re) if np.isfinite(Sx_re) else np.nan,
         "Sx_slide_source": slide_source,
         "Sx_restick_source": re_source,
-        "rd0": int(rd0),
         "went_low_first": int(went_low),
+
+        # phase outputs
+        "i_ss_phase": i_ss_phase,
+        "i_rs_phase": i_rs_phase,
+        "Ft_ss_phase_N": float(Ft[i_ss_phase]) if i_ss_phase is not None else np.nan,
+        "Ft_rs_phase_N": float(Ft[i_rs_phase]) if i_rs_phase is not None else np.nan,
+        "X_ss_phase_m": float(Xc[i_ss_phase]) if i_ss_phase is not None else np.nan,
+        "X_rs_phase_m": float(Xc[i_rs_phase]) if i_rs_phase is not None else np.nan,
+        "phi_ss_peak_rad": float(phi_ru_s[i_ss_rel_phase]) if i_ss_rel_phase is not None else np.nan,
+        "phi_rs_peak_rad": float(phi_rd_s[i_rs_rel_phase]) if i_rs_rel_phase is not None else np.nan,
+
+        # bookkeeping
+        "trans_mode_used": str(getattr(cfg, "trans_mode", "stiffness")).strip().lower(),
+        "rd0": int(rd0),
+        "Ft_valid_cut_N": float(Ft_cut),
+        "ru_valid_start_rel": int(i_ru_start),
+        "rd_valid_end_rel": int(i_rd_end),
     }
 
-    if i_ss is not None:
-        out["Ft_ss_N"] = float(Ft[i_ss])
-        out["X_ss_m"] = float(Xc[i_ss])
-    else:
-        out["Ft_ss_N"] = np.nan
-        out["X_ss_m"] = np.nan
+    # ------------------------------------------------------------------
+    # 10) Final selection by config
+    # ------------------------------------------------------------------
+    trans_mode = str(getattr(cfg, "trans_mode", "stiffness")).strip().lower()
 
-    if i_rs is not None:
-        out["Ft_rs_N"] = float(Ft[i_rs])
-        out["X_rs_m"] = float(Xc[i_rs])
+    if trans_mode == "phase":
+        out["i_ss"] = out["i_ss_phase"]
+        out["i_rs"] = out["i_rs_phase"]
+        out["Ft_ss_N"] = out["Ft_ss_phase_N"]
+        out["Ft_rs_N"] = out["Ft_rs_phase_N"]
+        out["X_ss_m"] = out["X_ss_phase_m"]
+        out["X_rs_m"] = out["X_rs_phase_m"]
+        out["trans_mode_used"] = "phase"
     else:
-        out["Ft_rs_N"] = np.nan
-        out["X_rs_m"] = np.nan
+        out["i_ss"] = out["i_ss_stiff"]
+        out["i_rs"] = out["i_rs_stiff"]
+        out["Ft_ss_N"] = out["Ft_ss_stiff_N"]
+        out["Ft_rs_N"] = out["Ft_rs_stiff_N"]
+        out["X_ss_m"] = out["X_ss_stiff_m"]
+        out["X_rs_m"] = out["X_rs_stiff_m"]
+        out["trans_mode_used"] = "stiffness"
 
     return out
 
@@ -1347,6 +1601,10 @@ def window_idx(t: np.ndarray, center_i: int, halfwidth_s: float) -> np.ndarray:
 def window_idx_fw(t: np.ndarray, start_i: int, width_s: float) -> np.ndarray:
     t0 = t[start_i]
     return np.where((t >= t0) & (t <= t0 + width_s))[0]
+
+def window_idx_bw(t: np.ndarray, start_i: int, width_s: float) -> np.ndarray:
+    t0 = t[start_i]
+    return np.where((t <= t0) & (t >= t0 - width_s))[0]
 
 def harmonics_energy_regime_dict(
     *,
@@ -1657,9 +1915,13 @@ def harmonics_energy_regime_dict(
             sE_fft = np.nan
 
         # Hysteresis width (requires tangential force amplitude)
-        Fmin =  1e-12 # 10× noise or 1 pN
+        Fmin = 1e-12
         if Ft_pk is not None and np.isfinite(Ft_pk[i]) and Ft_pk[i] > Fmin:
-            dx_h = E_fft / (4.0 * Ft_pk[i])
+            Fpk_i = float(Ft_pk[i])
+            if prefix == "hold":
+                dx_h = E_fft / (4.0 * Fpk_i)
+            else:
+                dx_h = E_fft / (np.pi * Fpk_i)
         else:
             dx_h = np.nan
 
@@ -1677,7 +1939,6 @@ def harmonics_energy_regime_dict(
         _p("E_li_tot_J"): float(E_li_tot),
         _p("P_li_mean_W"): float(P_li_mean),
     }
-
     # If FFT failed entirely in this slice, return lock-in totals only
     if not idx_used:
         return out
@@ -1788,3 +2049,388 @@ def harmonics_energy_regime_dict(
             out[_p("E_consistency_cal_minus_li_frac")] = float((E_harm_cal_tot - E_li_tot) / max(1e-30, E_li_tot))
 
     return out
+
+#####
+## Reconstruction of oscillation signals for hysteresis analysis
+#####
+def lockin_amp_phase_local(
+    t_w: np.ndarray,
+    x_w_m: np.ndarray,
+    f0_hz: float,
+    window: str = "hann",
+) -> tuple[float, float]:
+    """
+    Software lock-in estimate of amplitude and phase at known frequency f0_hz.
+
+    Returns
+    -------
+    A_pk : float
+        Peak amplitude in meters.
+    phi : float
+        Phase for cosine convention:
+            x(t) ~ A*cos(2*pi*f0*t + phi)
+    """
+    t_w = np.asarray(t_w, float)
+    x_w_m = np.asarray(x_w_m, float)
+
+    m = np.isfinite(t_w) & np.isfinite(x_w_m)
+    if np.sum(m) < 8:
+        return np.nan, np.nan
+
+    t_w = t_w[m]
+    x_w_m = x_w_m[m]
+
+    if window == "hann":
+        w = np.hanning(len(t_w))
+    else:
+        w = np.ones(len(t_w), float)
+
+    # remove weighted mean
+    wsum = np.sum(w)
+    if wsum <= 0:
+        return np.nan, np.nan
+    x0 = x_w_m - np.sum(w * x_w_m) / wsum
+
+    omega = 2.0 * np.pi * f0_hz
+
+    c = np.cos(omega * t_w)
+    s = np.sin(omega * t_w)
+
+    I = np.sum(w * x0 * c)
+    Q = np.sum(w * x0 * s)
+
+    # cosine-form convention:
+    # x = A*cos(wt + phi) = A*cos(phi)*cos(wt) - A*sin(phi)*sin(wt)
+    # so I ~ A*cos(phi), Q ~ -A*sin(phi)
+    C = 2.0 * I / wsum
+    S = -2.0 * Q / wsum
+
+    A_pk = np.sqrt(C * C + S * S)
+    phi = np.arctan2(S, C)
+
+    return float(A_pk), float(phi)
+
+def quadratic_peak_bin(mag: np.ndarray, k: int) -> float:
+    if k <= 0 or k >= len(mag) - 1:
+        return float(k)
+    a, b, c = mag[k - 1], mag[k], mag[k + 1]
+    denom = a - 2.0 * b + c
+    if denom == 0:
+        return float(k)
+    return float(k + 0.5 * (a - c) / denom)
+
+
+def fft_amp_phase(
+    xw_m: np.ndarray,
+    fs: float,
+    f_target: float,
+    search_half_width_bins: int = 2,
+) -> tuple[float, float]:
+    n = len(xw_m)
+    if n < 16:
+        return np.nan, np.nan
+
+    w = np.hanning(n)
+    x0 = (xw_m - np.mean(xw_m)) * w
+    X = np.fft.rfft(x0)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    mag = np.abs(X)
+
+    k0 = int(np.argmin(np.abs(freqs - f_target)))
+    last = len(X) - 1
+    k_lo = max(1, k0 - search_half_width_bins)
+    k_hi = min(last - 1, k0 + search_half_width_bins)
+    kk = k_lo + int(np.argmax(mag[k_lo:k_hi + 1]))
+
+    if 1 <= kk <= last - 1:
+        kf = quadratic_peak_bin(mag, kk)
+    else:
+        kf = float(kk)
+
+    kf = min(max(kf, 0.0), float(last))
+    k1 = int(np.floor(kf))
+    k2 = min(k1 + 1, last)
+    frac = kf - k1
+
+    Xf = (1.0 - frac) * X[k1] + frac * X[k2]
+
+    cg = 0.5
+    A_pk = 2.0 * np.abs(Xf) / (n * cg)
+    phi = np.angle(Xf)
+    return float(A_pk), float(phi)
+
+
+def lockin_amp_phase_local(
+    t_w: np.ndarray,
+    x_w_m: np.ndarray,
+    f0_hz: float,
+    window: str = "hann",
+) -> tuple[float, float]:
+    t_w = np.asarray(t_w, float)
+    x_w_m = np.asarray(x_w_m, float)
+
+    m = np.isfinite(t_w) & np.isfinite(x_w_m)
+    if np.sum(m) < 8:
+        return np.nan, np.nan
+
+    t_w = t_w[m]
+    x_w_m = x_w_m[m]
+
+    if window == "hann":
+        w = np.hanning(len(t_w))
+    else:
+        w = np.ones(len(t_w), float)
+
+    wsum = np.sum(w)
+    if wsum <= 0:
+        return np.nan, np.nan
+
+    x0 = x_w_m - np.sum(w * x_w_m) / wsum
+
+    omega = 2.0 * np.pi * f0_hz
+    c = np.cos(omega * t_w)
+    s = np.sin(omega * t_w)
+
+    I = np.sum(w * x0 * c)
+    Q = np.sum(w * x0 * s)
+
+    C = 2.0 * I / wsum
+    S = -2.0 * Q / wsum
+
+    A_pk = np.sqrt(C * C + S * S)
+    phi = np.arctan2(S, C)
+    return float(A_pk), float(phi)
+
+
+def wrap_to_pi(phi):
+    return np.angle(np.exp(1j * phi))
+
+
+def reconstruct_time_resolved_hysteresis(
+    *,
+    t: np.ndarray,
+    x_raw_nm: np.ndarray,
+    Ft_rms_N: np.ndarray,
+    sl: slice,
+
+    f1_guess_hz: float = 80.0,
+    max_harmonic: int = 3,
+    n_phase: int = 512,
+
+    target_cycles: float = 12.0,
+    target_samples: int = 120,
+    min_points_floor: int = 40,
+    min_points_frac: float = 0.8,
+
+    force_rms_to_peak: bool = True,
+
+    # single global reference
+    reference_slice: slice | None = None,
+    reference_phi1_rad: float | None = None,
+    transfer_phase_rad: float = 0.0,
+
+    # reconstruction mode
+    reconstruction_mode: str = "shape",   # "shape" or "absolute"
+):
+    """
+    Reconstruction using:
+      - fundamental amplitude/phase from software lock-in
+      - higher harmonics from FFT
+
+    Stored phases:
+      phi_raw_rad       : raw extracted harmonic phases
+      phi_abs_corr_rad  : corrected absolute phases (drive-referenced)
+      phi_rel_rad       : relative phases for shape reconstruction
+    """
+    if sl is None:
+        return {}
+    i0, i1 = int(sl.start), int(sl.stop)
+    if (i1 - i0) < 10:
+        return {}
+
+    if reconstruction_mode not in ("shape", "absolute"):
+        raise ValueError("reconstruction_mode must be 'shape' or 'absolute'.")
+
+    t = np.asarray(t, float)
+    x_raw_nm = np.asarray(x_raw_nm, float)
+    Ft_rms_N = np.asarray(Ft_rms_N, float)
+
+    dt = np.diff(t)
+    dt_pos = dt[np.isfinite(dt) & (dt > 0)]
+    if dt_pos.size < 5:
+        return {}
+
+    fs = float(1.0 / np.nanmedian(dt_pos))
+    if not np.isfinite(fs) or fs <= 0:
+        return {}
+
+    Tw = max(target_cycles / f1_guess_hz, target_samples / fs)
+    halfW = 0.5 * Tw
+    Nwin_exp = int(max(16, round(Tw * fs)))
+    min_points = int(max(min_points_floor, round(min_points_frac * Nwin_exp)))
+
+    theta = np.linspace(0.0, 2.0 * np.pi, int(n_phase), endpoint=False)
+
+    def local_extract(i: int):
+        tc = t[i]
+        j0 = max(0, np.searchsorted(t, tc - halfW, side="left"))
+        j1 = min(len(t), np.searchsorted(t, tc + halfW, side="right"))
+
+        if (j1 - j0) < min_points:
+            return None
+
+        tw = t[j0:j1]
+        xw_nm = x_raw_nm[j0:j1]
+        if not np.all(np.isfinite(xw_nm)):
+            return None
+        xw_m = xw_nm * 1e-9
+
+        A = np.full(max_harmonic, np.nan, float)
+        PH = np.full(max_harmonic, np.nan, float)
+
+        # --- fundamental from software lock-in ---
+        A[0], PH[0] = lockin_amp_phase_local(
+            t_w=tw,
+            x_w_m=xw_m,
+            f0_hz=f1_guess_hz,
+            window="hann",
+        )
+
+        # --- higher harmonics from FFT ---
+        for nh in range(2, max_harmonic + 1):
+            A[nh - 1], PH[nh - 1] = fft_amp_phase(
+                xw_m=xw_m,
+                fs=fs,
+                f_target=nh * f1_guess_hz,
+            )
+
+        return {
+            "idx": i,
+            "time_s": float(tc),
+            "f0_Hz": float(f1_guess_hz),
+            "A_pk_m": A,
+            "phi_raw_rad": PH,
+            "window": (int(j0), int(j1)),
+        }
+
+    # -----------------------------
+    # one global initial reference from phi1 only
+    # -----------------------------
+    phi_ref = reference_phi1_rad
+    if phi_ref is None:
+        if reference_slice is None:
+            reference_slice = sl
+
+        ri0, ri1 = int(reference_slice.start), int(reference_slice.stop)
+        ref_vals = []
+
+        for i in range(ri0, ri1):
+            out = local_extract(i)
+            if out is None:
+                continue
+            ph1 = out["phi_raw_rad"][0]
+            if np.isfinite(ph1):
+                ref_vals.append(ph1)
+
+        if len(ref_vals) == 0:
+            phi_ref = 0.0
+        else:
+            ref_vals = np.asarray(ref_vals, float)
+            phi_ref = float(np.angle(np.mean(np.exp(1j * ref_vals))))
+
+    idx_used = []
+    t_center_s = []
+    f0_used = []
+    x_rec_m = []
+    F_rec_N = []
+    A_pk_m = []
+    phi_raw_rad = []
+    phi_abs_corr_rad = []
+    phi_rel_rad = []
+    windows = []
+
+    for i in range(i0, i1):
+        out = local_extract(i)
+        if out is None:
+            continue
+
+        A = out["A_pk_m"]
+        PH_raw = out["phi_raw_rad"]
+
+        # fundamental absolute corrected phase:
+        # software-lock-in phase already referenced to the known drive,
+        # so no +2*pi*f*t correction is needed here
+        PH_abs = PH_raw.copy()
+        if np.isfinite(PH_abs[0]):
+            PH_abs[0] = wrap_to_pi(PH_abs[0] - phi_ref - transfer_phase_rad)
+
+        # higher harmonics kept as extracted for now, just referenced consistently
+        for nh in range(2, max_harmonic + 1):
+            if np.isfinite(PH_abs[nh - 1]):
+                PH_abs[nh - 1] = wrap_to_pi(PH_abs[nh - 1] - nh * phi_ref - nh * transfer_phase_rad)
+
+        # relative phases for shape-focused reconstruction
+        PH_rel = PH_abs.copy()
+        if np.isfinite(PH_abs[0]):
+            phi1_abs = PH_abs[0]
+            PH_rel[0] = 0.0
+            for nh in range(2, max_harmonic + 1):
+                if np.isfinite(PH_rel[nh - 1]):
+                    PH_rel[nh - 1] = wrap_to_pi(PH_abs[nh - 1] - nh * phi1_abs)
+
+        PH_use = PH_abs if reconstruction_mode == "absolute" else PH_rel
+
+        x_rec = np.zeros_like(theta)
+        for nh in range(1, max_harmonic + 1):
+            if np.isfinite(A[nh - 1]) and np.isfinite(PH_use[nh - 1]):
+                x_rec += A[nh - 1] * np.cos(nh * theta + PH_use[nh - 1])
+
+        if not np.isfinite(Ft_rms_N[i]):
+            continue
+
+        Fpk = float(Ft_rms_N[i])
+        if force_rms_to_peak:
+            Fpk *= np.sqrt(2.0)
+
+        F_rec = Fpk * np.cos(theta)
+
+        idx_used.append(out["idx"])
+        t_center_s.append(out["time_s"])
+        f0_used.append(out["f0_Hz"])
+        x_rec_m.append(x_rec)
+        F_rec_N.append(F_rec)
+        A_pk_m.append(A.copy())
+        phi_raw_rad.append(PH_raw.copy())
+        phi_abs_corr_rad.append(PH_abs.copy())
+        phi_rel_rad.append(PH_rel.copy())
+        windows.append(out["window"])
+
+    if not idx_used:
+        return {}
+
+    return {
+        "idx_used": np.asarray(idx_used, int),
+        "t_center_s": np.asarray(t_center_s, float),
+        "f0_Hz": np.asarray(f0_used, float),
+        "theta_rad": theta,
+        "x_rec_m": np.asarray(x_rec_m, float),
+        "F_rec_N": np.asarray(F_rec_N, float),
+        "A_pk_m": np.asarray(A_pk_m, float),
+        "phi_raw_rad": np.asarray(phi_raw_rad, float),
+        "phi_abs_corr_rad": np.asarray(phi_abs_corr_rad, float),
+        "phi_rel_rad": np.asarray(phi_rel_rad, float),
+        "windows": np.asarray(windows, int),
+        "meta": {
+            "fs_est_Hz": fs,
+            "Tw_s": Tw,
+            "min_points": min_points,
+            "f1_guess_hz": f1_guess_hz,
+            "max_harmonic": max_harmonic,
+            "phi_ref_rad": phi_ref,
+            "transfer_phase_rad": transfer_phase_rad,
+            "reconstruction_mode": reconstruction_mode,
+            "force_rms_to_peak": force_rms_to_peak,
+            "fundamental_phase_source": "software_lockin",
+            "higher_harmonics_source": "fft",
+        },
+    }

@@ -426,6 +426,25 @@ def plot_mindlin_fit(
     plt.tight_layout()
     return figure
 
+def plot_junc_growth(res):
+        plt.figure(figsize=(6, 4.5))
+        plt.plot(res.x, res.y, "k.-", label="data")
+        plt.plot(res.x, res.slope * res.x + res.intercept, "r-", lw=2, label="fit")
+
+        plt.text(
+            0.05, 0.95,
+            f"slope = {res.slope:.3e}",
+            transform=plt.gca().transAxes,
+            ha="left",
+            va="top"
+        )
+
+        plt.xlabel(r"$(F_t/P_z)^2$")
+        plt.ylabel(r"$(K/K_0)^4 - 1$")
+        plt.legend(frameon=False)
+        plt.tight_layout()
+        plt.show()
+
 def plot_hertz_diagnostic(h_m, P_N, fit: dict, 
                           title: str = "", hardness_Pa: float = np.nan, 
                           plasticity_p0_frac: float = 1.0) -> List[plt.Figure]:
@@ -813,7 +832,7 @@ def draw_span(ax, x0, x1, label="", **kw):
     ax.text((x0+x1)/2, 0.98, label, transform=ax.get_xaxis_transform(),
             va="top", ha="center", fontsize=9)
 
-def show_and_wait(fig_title: str = "", figures: List[plt.Figure] = []):
+def show_and_wait(fig_title: str = "", figures: List[plt.Figure] = [], outdir: str =""):
     # show the active figure and block until closed
     try:
         if fig_title and plt.get_fignums():
@@ -822,9 +841,17 @@ def show_and_wait(fig_title: str = "", figures: List[plt.Figure] = []):
         pass
     plt.draw()
     plt.pause(0.01)
+    def save_figs(figs = figures, base_name=fig_title, dpi=300):
+        for i, fig in enumerate(figs):
+            fig.savefig(outdir / f"{base_name}_{i}.png", dpi=dpi, bbox_inches="tight")
     def on_key(event):
         if event.key == "enter":
             plt.close("all")
+        if event.key == "*":
+            if(outdir == ""):
+                pass
+            else:
+                save_figs()
         else:
             pass
     try:
@@ -1062,3 +1089,313 @@ def sanity_plot_window_cycles(
 
     return figures
 
+def pick_representative_loop_index(
+    rec: dict,
+    method: str = "middle",
+    amplitude_key: str = "A_pk_m",
+) -> int:
+    """
+    Pick one representative loop index from a reconstructed regime dict.
+
+    method:
+        "middle"         -> middle valid time point
+        "median_A1"      -> loop whose A1 is closest to median A1
+        "max_A1"         -> largest fundamental amplitude
+        "min_A1"         -> smallest fundamental amplitude
+    """
+    n = len(rec.get("t_center_s", []))
+    if n == 0:
+        raise ValueError("Empty reconstruction dict.")
+
+    if method == "middle":
+        return n // 2
+
+    A = np.asarray(rec[amplitude_key], float)
+    A1 = A[:, 0]
+
+    good = np.where(np.isfinite(A1))[0]
+    if len(good) == 0:
+        return n // 2
+
+    if method == "median_A1":
+        med = np.nanmedian(A1[good])
+        return int(good[np.nanargmin(np.abs(A1[good] - med))])
+    if method == "max_A1":
+        return int(good[np.nanargmax(A1[good])])
+    if method == "min_A1":
+        return int(good[np.nanargmin(A1[good])])
+
+    raise ValueError(f"Unknown method: {method}")
+
+
+def plot_single_representative_loop(
+    rec: dict,
+    *,
+    idx: int | None = None,
+    pick_method: str = "median_A1",
+    x_scale: float = 1e9,
+    F_scale: float = 1e6,
+    x_label: str = "Reconstructed lateral displacement (nm)",
+    F_label: str = "Reconstructed lateral force (µN)",
+    title: str | None = None,
+    ax=None,
+):
+    """
+    Plot one representative loop from a single regime reconstruction dict.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.5, 5))
+    else:
+        fig = ax.figure
+
+    if idx is None:
+        idx = pick_representative_loop_index(rec, method=pick_method)
+
+    x = np.asarray(rec["x_rec_m"][idx], float) * x_scale
+    F = np.asarray(rec["F_rec_N"][idx], float) * F_scale
+    t0 = float(rec["t_center_s"][idx])
+
+    ax.plot(x, F, lw=2)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(F_label)
+    ax.grid(True, alpha=0.3)
+
+    if title is None:
+        title = f"Representative loop @ t = {t0:.3f} s"
+    ax.set_title(title)
+
+    return fig, ax, idx
+
+
+def plot_mean_loop(
+    rec: dict,
+    *,
+    x_scale: float = 1e9,
+    F_scale: float = 1e6,
+    x_label: str = "Reconstructed lateral displacement (nm)",
+    F_label: str = "Reconstructed lateral force (µN)",
+    title: str = "Mean reconstructed loop",
+    ax=None,
+):
+    """
+    Plot the mean loop across all valid local reconstructions in one regime.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5.5, 5))
+    else:
+        fig = ax.figure
+
+    x_mean = np.nanmean(np.asarray(rec["x_rec_m"], float), axis=0) * x_scale
+    F_mean = np.nanmean(np.asarray(rec["F_rec_N"], float), axis=0) * F_scale
+
+    ax.plot(x_mean, F_mean, lw=2)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(F_label)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    return fig, ax
+
+
+def plot_regime_comparison_loops(
+    rec_ru: dict | None = None,
+    rec_sl: dict | None = None,
+    rec_rd: dict | None = None,
+    *,
+    mode: str = "rep",   # "representative" or "mean"
+    pick_method: str = "median_A1",
+    x_scale: float = 1e9,
+    F_scale: float = 1e6,
+    title: str = "Reconstructed hysteresis loops by regime",
+):
+    """
+    Compare ramp-up / sliding / ramp-down loops on one figure.
+    """
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+
+    entries = [
+        (rec_ru, "Ramp-up partial slip"),
+        (rec_sl, "Sliding"),
+        (rec_rd, "Ramp-down partial slip"),
+    ]
+
+    for rec, label in entries:
+        if rec is None or len(rec.get("t_center_s", [])) == 0:
+            continue
+
+        if mode == "mean":
+            x = np.nanmean(np.asarray(rec["x_rec_m"], float), axis=0) * x_scale
+            F = np.nanmean(np.asarray(rec["F_rec_N"], float), axis=0) * F_scale
+        else:
+            idx = pick_representative_loop_index(rec, method=pick_method)
+            x = np.asarray(rec["x_rec_m"][idx], float) * x_scale
+            F = np.asarray(rec["F_rec_N"][idx], float) * F_scale
+
+        ax.plot(x, F, lw=2, label=label)
+
+    ax.set_xlabel("Reconstructed lateral displacement (nm)")
+    ax.set_ylabel("Reconstructed lateral force (µN)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    return fig, ax
+
+
+def plot_loop_evolution(
+    rec: dict,
+    *,
+    n_show: int = 6,
+    evenly_spaced: bool = True,
+    color_by_time: bool = True,
+    x_scale: float = 1e9,
+    F_scale: float = 1e6,
+    title: str = "Loop evolution over time",
+    ax=None,
+):
+    """
+    Plot several loops from one regime to show time evolution.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5.5))
+    else:
+        fig = ax.figure
+
+    n = len(rec.get("t_center_s", []))
+    if n == 0:
+        raise ValueError("Empty reconstruction dict.")
+
+    if evenly_spaced:
+        idxs = np.linspace(0, n - 1, min(n_show, n), dtype=int)
+        idxs = np.unique(idxs)
+    else:
+        idxs = np.arange(min(n_show, n))
+
+    t_used = np.asarray(rec["t_center_s"], float)
+
+    if color_by_time:
+        tmin = np.nanmin(t_used)
+        tmax = np.nanmax(t_used)
+        denom = max(1e-30, tmax - tmin)
+
+    for idx in idxs:
+        x = np.asarray(rec["x_rec_m"][idx], float) * x_scale
+        F = np.asarray(rec["F_rec_N"][idx], float) * F_scale
+
+        if color_by_time:
+            cval = (t_used[idx] - tmin) / denom
+            ax.plot(x, F, color=plt.cm.viridis(cval), lw=1.5, alpha=0.95)
+        else:
+            ax.plot(x, F, lw=1.5, alpha=0.85)
+
+    ax.set_xlabel("Reconstructed lateral displacement (nm)")
+    ax.set_ylabel("Reconstructed lateral force (µN)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    return fig, ax
+
+def plot_reconstruction_diagnostics_ref(
+    rec: dict,
+    *,
+    title_prefix: str = "",
+    smooth_phase: bool = True,
+    phase_smooth_win: int = 15,
+    mask_low_amp: bool = True,
+    A1_min_nm: float = 0.05,
+    A2_min_nm: float = 0.05,
+    A3_min_nm: float = 0.05,
+):
+    t_used = np.asarray(rec["t_center_s"], float)
+    f0 = np.asarray(rec["f0_Hz"], float)
+    A = np.asarray(rec["A_pk_m"], float)
+    PH_abs = np.asarray(rec["phi_abs_corr_rad"], float)
+    PH_rel = np.asarray(rec["phi_rel_rad"], float)
+
+    def circular_smooth(phi: np.ndarray, win: int = 11) -> np.ndarray:
+        phi = np.asarray(phi, float)
+        out = np.full_like(phi, np.nan)
+
+        good = np.isfinite(phi)
+        if np.sum(good) < max(3, win):
+            return phi
+
+        z = np.exp(1j * phi[good])
+        kernel = np.ones(win, float) / float(win)
+
+        zr = np.convolve(np.real(z), kernel, mode="same")
+        zi = np.convolve(np.imag(z), kernel, mode="same")
+
+        out[good] = np.angle(zr + 1j * zi)
+        return out
+
+    fig, ax = plt.subplots(4, 1, figsize=(9, 8), sharex=True)
+
+    # -----------------------------
+    # f0
+    # -----------------------------
+    ax[0].plot(t_used, f0, lw=1.5)
+    ax[0].set_ylabel("f0 (Hz)")
+    ax[0].grid(True, alpha=0.3)
+
+    # -----------------------------
+    # amplitudes
+    # -----------------------------
+    A_nm = A * 1e9
+    if A.shape[1] >= 1:
+        ax[1].plot(t_used, A_nm[:, 0], label="A1", lw=1.5)
+    if A.shape[1] >= 2:
+        ax[1].plot(t_used, A_nm[:, 1], label="A2", lw=1.5)
+    if A.shape[1] >= 3:
+        ax[1].plot(t_used, A_nm[:, 2], label="A3", lw=1.5)
+    ax[1].set_ylabel("Amplitude (nm)")
+    ax[1].legend()
+    ax[1].grid(True, alpha=0.3)
+
+    # -----------------------------
+    # phi1 absolute corrected:
+    # keep WRAPPED and optionally circular-smooth
+    # -----------------------------
+    phi1_plot = PH_abs[:, 0].copy()
+
+    if mask_low_amp and A.shape[1] >= 1:
+        phi1_plot[A_nm[:, 0] < A1_min_nm] = np.nan
+
+    if smooth_phase:
+        phi1_plot = circular_smooth(phi1_plot, win=phase_smooth_win)
+
+    ax[2].plot(t_used, phi1_plot, label="phi1 abs corr", lw=1.5)
+    ax[2].set_ylabel("phi1 abs (rad)")
+    ax[2].legend()
+    ax[2].grid(True, alpha=0.3)
+
+    # -----------------------------
+    # relative higher-harmonic phases
+    # keep wrapped; mask when amplitudes are tiny
+    # -----------------------------
+    if PH_rel.shape[1] >= 2:
+        phi2_plot = PH_rel[:, 1].copy()
+        if mask_low_amp and A.shape[1] >= 2:
+            phi2_plot[A_nm[:, 1] < A2_min_nm] = np.nan
+        if smooth_phase:
+            phi2_plot = circular_smooth(phi2_plot, win=phase_smooth_win)
+        ax[3].plot(t_used, phi2_plot, label="phi2 rel", lw=1.5)
+
+    if PH_rel.shape[1] >= 3:
+        phi3_plot = PH_rel[:, 2].copy()
+        if mask_low_amp and A.shape[1] >= 3:
+            phi3_plot[A_nm[:, 2] < A3_min_nm] = np.nan
+        if smooth_phase:
+            phi3_plot = circular_smooth(phi3_plot, win=phase_smooth_win)
+        ax[3].plot(t_used, phi3_plot, label="phi3 rel", lw=1.5)
+
+    ax[3].set_ylabel("rel phase (rad)")
+    ax[3].set_xlabel("Time (s)")
+    ax[3].legend()
+    ax[3].grid(True, alpha=0.3)
+
+    title = "Reconstruction diagnostics" if not title_prefix else f"{title_prefix} reconstruction diagnostics"
+    fig.suptitle(title)
+    fig.tight_layout()
+
+    return fig, ax

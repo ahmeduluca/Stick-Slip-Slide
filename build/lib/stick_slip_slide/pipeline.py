@@ -483,7 +483,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             P_min_N=getattr(cfg, "flat_Pmin_N", None),
             P_max_N=getattr(cfg, "flat_Pmax_N", None),
             robust=True,
-            n_iter=int(getattr(cfg, "flat_iter", 6)),
+            n_iter=int(getattr(cfg, "flat_iter", 50)),
             clip_sigma=float(getattr(cfg, "flat_clip_sigma", 3.0)),
             min_points=int(getattr(cfg, "flat_min_points", 30)),
         )
@@ -556,7 +556,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             P_min_N=getattr(cfg, "flat_Pmin_N", None),
             P_max_N=getattr(cfg, "flat_Pmax_N", None),
             robust=True,
-            n_iter=int(getattr(cfg, "flat_iter", 6)),
+            n_iter=int(getattr(cfg, "flat_iter", 50)),
             clip_sigma=float(getattr(cfg, "flat_clip_sigma", 3.0)),
             min_points=int(getattr(cfg, "flat_min_points", 30)),
         ),
@@ -566,7 +566,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
         min_success=int(getattr(cfg, "flat_boot_min_success", 50)),
         block_size=int(getattr(cfg, "flat_boot_block", 10)),
     )
-        
+    df2["A_m2"] = A_m2_used
     # pick reference area consistently from same ref window
     A_ref = robust_median(A_m2_used[ref_i]) if ref_i.size else np.nan
     if (not np.isfinite(A_ref)) or (A_ref <= 0):
@@ -651,6 +651,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
 
     # final “reported” reference values
     A_ref = float(A_stats["median"])
+    sigma_A_ref = ci95_to_sigma(A_stats["mean"], A_stats["ci95"][0], A_stats["ci95"][1])
     p_report_GPa = float(p_stats["median"] / 1e9)
     pressure_ci95_lo_GPa = float(p_stats["ci95"][0] / 1e9)
     pressure_ci95_hi_GPa = float(p_stats["ci95"][1] / 1e9)
@@ -667,6 +668,7 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     rows: List[Dict] = []
     area_cycles: List[float] = [A_ref]  # area before cycle 1 (reference)
     tr={}
+    Sz_ref0 = Sz_ref
     for b in cycles:
         try:
             # transitions
@@ -678,9 +680,24 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
                 frac_low=cfg.trans_frac_down,
                 low_frac_band=cfg.trans_low_band,
                 smooth_n=cfg.trans_smooth_n,
+                cfg=cfg
             )
+            trans = tr
+            print({
+                "mode": trans["trans_mode_used"],
+                "i_ss": trans["i_ss"],
+                "i_rs": trans["i_rs"],
+                "i_ss_stiff": trans["i_ss_stiff"],
+                "i_rs_stiff": trans["i_rs_stiff"],
+                "i_ss_phase": trans["i_ss_phase"],
+                "i_rs_phase": trans["i_rs_phase"],
+                "phi_ss_peak_rad": trans["phi_ss_peak_rad"],
+                "phi_rs_peak_rad": trans["phi_rs_peak_rad"],
+            })
         except Exception as e:
             tr = {}
+            tb = traceback.format_exc()
+            print(tb)
 
         # interactive per-cycle plots
         if live_plots and getattr(cfg, "plot_cycles", False):
@@ -697,7 +714,8 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             df2, cfg, b, tr,
             h_ref=h_ref,
             A_ref=A_ref,
-            Sz_ref=Sz_ref,
+            Sz_ref=Sz_ref0,
+            outdir=outdir
         )
         try:
             # ---- robust divide-by-zero / tiny-area guards ----
@@ -840,6 +858,9 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
             row = {"cycle": b.cycle, "ok": 0, "error": str(e)}
 ### Rows of each cycle friction and area metrics, plus metadata about fits and transitions, get collected into a list of dicts, which is then made into a DataFrame at the end. This is the main per-cycle output of the analysis.
         rows.append(row)
+        Sz_ref0 = row.get("Sz_end_cyc", Sz_ref)
+        print(Sz_ref)
+        print(Sz_ref0)
 # Ramp-up and Ramp-down Mindlin fits plot function(s) here
         if getattr(cfg, "plot_mindlin", False):
             figs.append(plot_mindlin_fit(
@@ -884,7 +905,12 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
     report["Sz_ref_N_per_m"] = float(Sz_ref) if np.isfinite(Sz_ref) else np.nan
     report["initial_h_nm"] = float(h_ref * 1e9) if np.isfinite(h_ref) else np.nan
     report["A_ref_um2"] = float(A_ref * 1e12) if np.isfinite(A_ref) else np.nan
+    report["sigma_A_ref"] = float(sigma_A_ref * 1e12) if np.isfinite(sigma_A_ref) else np.nan
     report["area_mode_used"] = str(area_mode_used)
+    try:
+        report["initial_hold_time"] = t[cycles[0].i_start] - t[i0] if cycles is not None and i0 is not None else 0
+    except:
+        report["initial_hold_time"] = 0.
 
     report["load_max_mN"] = float(load_max_mN) if np.isfinite(load_max_mN) else np.nan
     report["pressure_ref_GPa"] = float(p_report_GPa) if np.isfinite(p_report_GPa) else np.nan
@@ -893,9 +919,12 @@ def analyze_one_file(fp: Path, cfg, live_plots: bool, outdir: Optional[Path]) ->
 
     report["R_from_CSM_a_h_um"] = float(R_csm_a_h * 1e6) if np.isfinite(R_csm_a_h) else np.nan
     report["R_from_CSM_a_P_um"] = float(R_csm_a_P * 1e6) if np.isfinite(R_csm_a_P) else np.nan
-    report["A_ref_csm_um2"] = (float(np.nanmedian(A_csm[ref_i])) * 1e12) if (A_csm is not None and ref_i.size) else np.nan
-    report["a_ref_csm_um"] = (float(np.nanmedian(a_csm[ref_i])) * 1e6) if (a_csm is not None and ref_i.size) else np.nan
-
+    try:
+        report["A_ref_csm_um2"] = (float(np.nanmedian(A_csm[ref_i])) * 1e12) if (A_csm is not None and ref_i.size) else np.nan
+        report["a_ref_csm_um"] = (float(np.nanmedian(a_csm[ref_i])) * 1e6) if (a_csm is not None and ref_i.size) else np.nan
+    except:
+        report["A_ref_csm_um2"] = np.nan
+        report["a_ref_csm_um"] =  np.nan
     # ---- Hertz/adhesion outputs
     report["E_star_GPa"] = float(E_star / 1e9) if _finite(E_star) else np.nan
     report["R_eff_um"] = float(hertz.get("R_eff_m", np.nan) * 1e6) if np.isfinite(hertz.get("R_eff_m", np.nan)) else np.nan

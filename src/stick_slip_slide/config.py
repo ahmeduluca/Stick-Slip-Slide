@@ -123,6 +123,11 @@ class Config:
     resticking_lateral_stiffness_thresh: float = 1000.0 # N/m minimum S_thresh for slide->stick
     trans_low_band: tuple[float, float] = (0.05, 0.20)  # early ramp-up force band to estimate S_stuck
     trans_smooth_n: int = 21
+    trans_mode: str = "phase" #transition by "phase" maxima or thershold "stiffness".
+    trans_skip_start_frac_up: float = 0.045
+    trans_skip_end_frac_dn: float = 0.045
+    trans_min_valid_Ft_frac: float = 0.03
+    phase_near_max_frac: float = 0.98 # Phase turnover near max furing ramp-up and ramp-down (calculated separate for both range)
 
     # Mindlin fit K(Q)=a*(1-Q/t)^(1/3) on ramp-up
     mindlin_min_frac_of_maxF: float = 0.1
